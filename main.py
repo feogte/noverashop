@@ -16,17 +16,23 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from dotenv import load_dotenv
 
 load_dotenv()
-TOKEN = os.getenv("BOT_TOKEN")
-_raw_admin_id = os.getenv("ADMIN_ID", "8872934046").strip()
-try:
-    ADMIN_ID = int(_raw_admin_id)
-except ValueError:
-    ADMIN_ID = 8872934046
-DB_PATH = os.getenv("DB_PATH", "data/shop.db")
-Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+
+# Bothost automatically provides the Telegram bot token as BOT_TOKEN.
+# Fallback names are supported for compatibility with Bothost configurations.
+TOKEN = (
+    os.getenv("BOT_TOKEN")
+    or os.getenv("TELEGRAM_BOT_TOKEN")
+    or os.getenv("API_TOKEN")
+    or os.getenv("TOKEN")
+)
 
 if not TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set")
+    raise RuntimeError("Telegram bot token was not provided by the hosting platform")
+
+# These settings are built into the application; no manual env variables are needed.
+ADMIN_ID = 8872934046
+DB_PATH = "data/shop.db"
+Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 
 bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
@@ -145,12 +151,6 @@ async def save_user(message: Message):
     await conn.commit()
     await conn.close()
 
-async def main_keyboard(user_id: int):
-    kb = ReplyKeyboardBuilder()
-    kb.button(text=await text("catalog"))
-    kb.row(ReplyKeyboardBuilder().button(text=await text("reviews")).buttons[0])
-    return kb.as_markup(resize_keyboard=True)
-
 async def home_keyboard(user_id: int):
     kb = ReplyKeyboardBuilder()
     kb.button(text=await text("catalog"))
@@ -222,7 +222,6 @@ async def text_router(message: Message, state: FSMContext):
         await show_products(message, "account")
     elif value == await text("stars"):
         await show_products(message, "stars")
-
 
 def edit_keyboard():
     kb = ReplyKeyboardBuilder()
@@ -402,8 +401,7 @@ async def show_stock(message: Message):
     await message.answer("\n".join(lines), reply_markup=add_product_keyboard())
 
 def add_product_keyboard():
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Добавить товар", callback_data="add_product")]])
-    return kb
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Добавить товар", callback_data="add_product")]])
 
 @dp.callback_query(F.data == "add_product")
 async def add_product_start(call: CallbackQuery, state: FSMContext):
