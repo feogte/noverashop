@@ -125,8 +125,14 @@ async def prepare_subscription_link():
 async def is_subscribed(user_id):
     try:
         member = await bot.get_chat_member(chat_id=SUB_CHANNEL_ID, user_id=user_id)
-        return member.status in {"member", "administrator", "creator"}
-    except Exception:
+        status = getattr(member.status, "value", member.status)
+        if status in {"member", "administrator", "creator"}:
+            return True
+        if status == "restricted" and getattr(member, "is_member", False):
+            return True
+        return False
+    except Exception as e:
+        print(f"[SUBSCRIPTION CHECK ERROR] user={user_id}: {type(e).__name__}: {e}")
         return False
 
 async def subscription_gate(event):
@@ -175,12 +181,13 @@ def inline_back(callback_data):
 
 @dp.callback_query(F.data == "sub:check")
 async def subscription_check(call):
-    if await is_subscribed(call.from_user.id):
+    subscribed = await is_subscribed(call.from_user.id)
+    if subscribed:
         await save_user_id(call.from_user)
         await call.answer("Подписка подтверждена ✅")
         await call.message.answer("Подписка подтверждена. Добро пожаловать!", reply_markup=home_kb(call.from_user.id))
     else:
-        await call.answer("Вы ещё не подписались", show_alert=True)
+        await call.answer("Подписка ещё не найдена. Подпишитесь на канал и нажмите кнопку ещё раз.", show_alert=True)
 
 @dp.message(CommandStart())
 async def start(m, state):
