@@ -17,7 +17,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "8872934046"))
+_raw_admin_id = os.getenv("ADMIN_ID", "8872934046").strip()
+try:
+    ADMIN_ID = int(_raw_admin_id)
+except ValueError:
+    ADMIN_ID = 8872934046
 DB_PATH = os.getenv("DB_PATH", "data/shop.db")
 Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 
@@ -55,7 +59,7 @@ COUNTRY_FLAGS = {
     "93": "🇦🇫", "94": "🇱🇰", "95": "🇲🇲", "98": "🇮🇷", "212": "🇲🇦", "213": "🇩🇿",
     "216": "🇹🇳", "218": "🇱🇾", "234": "🇳🇬", "254": "🇰🇪", "255": "🇹🇿", "380": "🇺🇦",
     "381": "🇷🇸", "420": "🇨🇿", "421": "🇸🇰", "423": "🇱🇮", "852": "🇭🇰", "853": "🇲🇴",
-    "886": "🇹🇼", "972": "🇮🇱", "971": "🇦🇪", "972": "🇮🇱", "995": "🇬🇪", "998": "🇺🇿",
+    "886": "🇹🇼", "972": "🇮🇱", "971": "🇦🇪", "995": "🇬🇪", "998": "🇺🇿",
 }
 
 class AddProduct(StatesGroup):
@@ -142,18 +146,6 @@ async def save_user(message: Message):
     await conn.close()
 
 async def main_keyboard(user_id: int):
-    kb = ReplyKeyboardBuilder()
-    kb.button(text=await text("catalog"))
-    kb.adjust(1)
-    kb.row(ReplyKeyboardBuilder().button(text=await text("reviews")).button(text=await text("support")).buttons[0])
-    # Rebuild the second row cleanly because ReplyKeyboardBuilder.button returns the builder.
-    kb = ReplyKeyboardBuilder()
-    kb.button(text=await text("catalog"))
-    kb.adjust(1)
-    kb.row(
-        ReplyKeyboardBuilder().button(text=await text("reviews"))
-    )
-    # Directly use a simple builder for the remaining buttons.
     kb = ReplyKeyboardBuilder()
     kb.button(text=await text("catalog"))
     kb.row(ReplyKeyboardBuilder().button(text=await text("reviews")).buttons[0])
