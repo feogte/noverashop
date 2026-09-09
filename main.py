@@ -11,7 +11,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from dotenv import load_dotenv
 
@@ -39,9 +39,12 @@ FLAGS = {"1":"🇺🇸","7":"🇷🇺","20":"🇪🇬","27":"🇿🇦","30":"�
 
 class AddProduct(StatesGroup):
     kind=State(); name=State(); price_rub=State(); price_stars=State(); stock=State()
-class Broadcast(StatesGroup): text=State()
-class EditText(StatesGroup): key=State(); value=State()
-class Payment(StatesGroup): screenshot=State()
+class Broadcast(StatesGroup):
+    text=State()
+class EditText(StatesGroup):
+    key=State(); value=State()
+class Payment(StatesGroup):
+    screenshot=State()
 
 def is_admin(uid): return uid == ADMIN_ID
 
@@ -95,7 +98,9 @@ def admin_kb():
 
 async def home_kb(uid):
     kb=ReplyKeyboardBuilder(); kb.button(text=await text("catalog")); kb.adjust(1)
-    kb.row(ReplyKeyboardBuilder().button(text=await text("reviews")).buttons[0],ReplyKeyboardBuilder().button(text=await text("support")).buttons[0])
+    row=ReplyKeyboardBuilder(); row.button(text=await text("reviews")); row.button(text=await text("support"))
+    for button in list(row.buttons): kb.add(button)
+    kb.adjust(1,2)
     if is_admin(uid): kb.button(text=await text("admin")); kb.adjust(1)
     return kb.as_markup(resize_keyboard=True)
 
@@ -176,7 +181,7 @@ async def screenshot(m,state):
     d=await state.get_data(); conn=await db(); p=await one(conn,"SELECT * FROM products WHERE id=?",(d.get("product_id"),))
     if not p: await conn.close(); await state.clear(); return
     now=datetime.now(); cur=await conn.execute("INSERT INTO purchases(user_id,product_id,product_name,payment,amount,screenshot_file_id,created_at) VALUES(?,?,?,?,?,?,?)",(m.from_user.id,p["id"],p["name"],d.get("payment",""),d.get("amount",0),m.photo[-1].file_id,now.isoformat())); pid=cur.lastrowid
-    await conn.commit(); await conn.close()
+    await cur.close(); await conn.commit(); await conn.close()
     username=f"@{m.from_user.username}" if m.from_user.username else "нет"
     caption=f"Новая покупка! 🧾\nкупили: {p['name']}\nайди: {m.from_user.id}\nюзернейм: {username}\nцена: {d.get('amount')} {'Stars' if d.get('payment')=='stars' else '₽'}\nвремя покупки по мск: {now.strftime('%d.%m.%Y %H:%M')}\nзаявка: #{pid}"
     kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Одобрить",callback_data=f"purchase:approve:{pid}"),InlineKeyboardButton(text="Отклонить",callback_data=f"purchase:reject:{pid}")]])
@@ -202,7 +207,7 @@ async def stats(m):
     conn=await db(); total=await one(conn,"SELECT COUNT(*) c FROM purchases WHERE status='approved'"); rub=await one(conn,"SELECT COALESCE(SUM(amount),0) v FROM purchases WHERE status='approved' AND payment='rub'"); stars=await one(conn,"SELECT COALESCE(SUM(amount),0) v FROM purchases WHERE status='approved' AND payment='stars'"); users=await one(conn,"SELECT COUNT(*) c FROM users")
     today=datetime.now().date().isoformat(); tr=await one(conn,"SELECT COALESCE(SUM(amount),0) v FROM purchases WHERE status='approved' AND payment='rub' AND date(created_at)=?",(today,)); ts=await one(conn,"SELECT COALESCE(SUM(amount),0) v FROM purchases WHERE status='approved' AND payment='stars' AND date(created_at)=?",(today,)); best=await all_rows(conn,"SELECT product_name,COUNT(*) c FROM purchases WHERE status='approved' GROUP BY product_id ORDER BY c DESC LIMIT 5"); await conn.close()
     besttxt="\n".join(f"{i+1}. {r['product_name']} — {r['c']}" for i,r in enumerate(best)) or "нет"
-    await m.answer(f"Всего продаж: {total['c']}\nЗаработано ₽: {rub['v']:.0f}\nЗаработано Stars: {stars['v']:.0f}\nЗаработано за сегодня: {tr['v']:.0f}₽ / {ts['v']:.0f} Stars\nКоличество пользователей: {users['c']}\n\nСамые продаваемые товары:\n{besttxt}")
+    await m.answer(f"Всего продаж: {total['c']}\nЗаработано ₽: {rub['v']:.0f}\nЗаработано Stars: {stars['v']:.0f}\nЗа сегодня: {tr['v']:.0f}₽ / {ts['v']:.0f} Stars\nКоличество пользователей: {users['c']}\n\nСамые продаваемые товары:\n{besttxt}")
 
 async def stock(m):
     conn=await db(); rows=await all_rows(conn,"SELECT * FROM products ORDER BY kind,id"); await conn.close(); lines=[]
