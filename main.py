@@ -75,6 +75,14 @@ async def all_rows(conn, sql, params=()):
     finally:
         await cur.close()
 
+async def text(key):
+    conn = await db()
+    try:
+        row = await one(conn, "SELECT value FROM texts WHERE key=?", (key,))
+        return row["value"] if row else TEXTS.get(key, key)
+    finally:
+        await conn.close()
+
 async def init_db():
     conn = await db()
     await conn.executescript("""
