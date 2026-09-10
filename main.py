@@ -226,7 +226,7 @@ async def purchase_action(call):
         if cur.rowcount==0: await cur.close(); await conn.close(); return await call.answer("Товар уже закончился",show_alert=True)
         await cur.close(); await conn.execute("UPDATE purchases SET status='approved' WHERE id=?",(pid,)); status="Одобрено"
     else: await conn.execute("UPDATE purchases SET status='rejected' WHERE id=?",(pid,)); status="Отклонено"
-    await conn.commit(); await conn.close(); await call.message.edit_reply_markup(reply_markup=None); await call.message.answer(f"Заявка #{pid}: {status}");
+    await conn.commit(); await conn.close(); await call.message.edit_reply_markup(reply_markup=None); await call.message.answer(f"Заявка #{pid}: {status}")
     try: await bot.send_message(p["user_id"],f"Ваша заявка #{pid}: {status}.")
     except Exception: pass
     await call.answer()
@@ -235,13 +235,14 @@ async def stats(m):
     conn=await db(); total=await one(conn,"SELECT COUNT(*) c FROM purchases WHERE status='approved'"); rub=await one(conn,"SELECT COALESCE(SUM(amount),0) v FROM purchases WHERE status='approved' AND payment='rub'"); stars=await one(conn,"SELECT COALESCE(SUM(amount),0) v FROM purchases WHERE status='approved' AND payment='stars'"); users=await one(conn,"SELECT COUNT(*) c FROM users"); today=now_msk().date().isoformat(); tr=await one(conn,"SELECT COALESCE(SUM(amount),0) v FROM purchases WHERE status='approved' AND payment='rub' AND date(created_at)=?",(today,)); ts=await one(conn,"SELECT COALESCE(SUM(amount),0) v FROM purchases WHERE status='approved' AND payment='stars' AND date(created_at)=?",(today,)); best=await all_rows(conn,"SELECT product_name,COUNT(*) c FROM purchases WHERE status='approved' GROUP BY product_id ORDER BY c DESC LIMIT 5"); await conn.close(); besttxt="\n".join(f"{i+1}. {r['product_name']} — {r['c']}" for i,r in enumerate(best)) or "нет"; await m.answer(f"Всего продаж: {total['c']}\nЗаработано ₽: {rub['v']:.0f}\nЗаработано Stars: {stars['v']:.0f}\n\nЗа сегодня:\n₽: {tr['v']:.0f}\nStars: {ts['v']:.0f}\n\nКоличество пользователей: {users['c']}\n\nСамые продаваемые товары:\n{besttxt}",reply_markup=admin_kb())
 
 async def stock(m):
-    conn=await db(); rows=await all_rows(conn,"SELECT * FROM products ORDER BY kind,id"); await conn.close();
+    conn=await db(); rows=await all_rows(conn,"SELECT * FROM products ORDER BY kind,id"); await conn.close()
     if not rows: return await m.answer("Склад пуст.",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Добавить товар",callback_data="add_product")],[inline_back("back:admin")]]))
     kb=InlineKeyboardBuilder()
     for p in rows:
-        kb.button(text=f"🗑 {product_label(p,p['kind'])} — {p['stock']} шт",callback_data=f"delete_product:{p['id']}")
+        stock_text=f"{product_label(p,p['kind'])} — {p['stock']} шт — ⭐ {p['price_stars']} Stars"
+        kb.button(text=f"🗑 {stock_text}",callback_data=f"delete_product:{p['id']}")
     kb.button(text="➕ Добавить товар",callback_data="add_product"); kb.button(text="⬅️ Назад",callback_data="back:admin"); kb.adjust(1)
-    await m.answer("Нажмите на товар, чтобы удалить его со склада:\n\n"+"\n".join(f"{product_label(p,p['kind'])} — {p['stock']} шт" for p in rows),reply_markup=kb.as_markup())
+    await m.answer("Нажмите на товар, чтобы удалить его со склада:\n\n"+"\n".join(f"{product_label(p,p['kind'])} — {p['stock']} шт — ⭐ {p['price_stars']} Stars" for p in rows),reply_markup=kb.as_markup())
 
 @dp.callback_query(F.data.startswith("delete_product:"))
 async def delete_product(call):
