@@ -3,6 +3,7 @@ import os
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
+import secrets
 
 import aiosqlite
 from aiogram import Bot, Dispatcher, F
@@ -30,6 +31,7 @@ bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 MSK = ZoneInfo("Europe/Moscow")
 SUB_INVITE_LINK = ""
+REFERRAL_GOAL = 20
 
 TEXTS = {
     "welcome": "Привет, {name}\nТут ты можешь приобрести все что душе угодно.",
@@ -38,6 +40,7 @@ TEXTS = {
     "broadcast": "Рассылка", "edit_text": "Изменить текст",
     "choose_type": "Выберите тип товара", "accounts": "Аккаунты", "stars": "Звезды",
     "change_button": "Изменить текст кнопки", "change_message": "Изменить текст сообщения",
+    "referral": "🎁 Рефералка",
 }
 FLAGS = {"1":"🇺🇸","7":"🇷🇺","20":"🇪🇬","27":"🇿🇦","30":"🇬🇷","31":"🇳🇱","32":"🇧🇪","33":"🇫🇷","34":"🇪🇸","36":"🇭🇺","39":"🇮🇹","40":"🇷🇴","41":"🇨🇭","43":"🇦🇹","44":"🇬🇧","45":"🇩🇰","46":"🇸🇪","47":"🇳🇴","48":"🇵🇱","49":"🇩🇪","51":"🇵🇪","52":"🇲🇽","53":"🇨🇺","54":"🇦🇷","55":"🇧🇷","56":"🇨🇱","57":"🇨🇴","58":"🇻🇪","60":"🇲🇾","61":"🇦🇺","62":"🇮🇩","63":"🇵🇭","64":"🇳🇿","65":"🇸🇬","66":"🇹🇭","81":"🇯🇵","82":"🇰🇷","84":"🇻🇳","86":"🇨🇳","90":"🇹🇷","91":"🇮🇳","92":"🇵🇰","93":"🇦🇫","94":"🇱🇰","95":"🇲🇲","98":"🇮🇷","212":"🇲🇦","213":"🇩🇿","216":"🇹🇳","218":"🇱🇾","234":"🇳🇬","254":"🇰🇪","255":"🇹🇿","380":"🇺🇦","381":"🇷🇸","420":"🇨🇿","421":"🇸🇰","423":"🇱🇮","852":"🇭🇰","853":"🇲🇴","886":"🇹🇼","972":"🇮🇱","971":"🇦🇪","995":"🇬🇪","998":"🇺🇿"}
 
@@ -75,6 +78,10 @@ async def init_db():
     CREATE TABLE IF NOT EXISTS texts(key TEXT PRIMARY KEY, value TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS products(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, name TEXT NOT NULL, price_rub REAL NOT NULL, price_stars INTEGER NOT NULL, stock INTEGER NOT NULL DEFAULT 0, sales INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS purchases(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, product_id INTEGER NOT NULL, product_name TEXT NOT NULL, payment TEXT NOT NULL, amount REAL NOT NULL, screenshot_file_id TEXT, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS referral_links(id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER NOT NULL UNIQUE, code TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS referral_joins(id INTEGER PRIMARY KEY AUTOINCREMENT, referral_id INTEGER NOT NULL, invited_user_id INTEGER NOT NULL UNIQUE, verified_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS referral_claims(id INTEGER PRIMARY KEY AUTOINCREMENT, referral_id INTEGER NOT NULL UNIQUE, owner_id INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS pending_referrals(user_id INTEGER PRIMARY KEY, referral_code TEXT NOT NULL, created_at TEXT NOT NULL);
     """)
     for k,v in TEXTS.items(): await conn.execute("INSERT OR IGNORE INTO texts(key,value) VALUES(?,?)", (k,v))
     await conn.commit(); await conn.close()
@@ -108,12 +115,78 @@ async def subscription_gate(event):
     else: await event.answer(msg,reply_markup=markup)
     return False
 
+async def get_or_create_referral(user_id):
+    conn=await db(); row=await one(conn,"SELECT * FROM referral_links WHERE owner_id=?",(user_id,))
+    if row: await conn.close(); return row
+    while True:
+        code=secrets.token_urlsafe(8).replace("-", "_").replace("", "")
+        if not await one(conn,"SELECT id FROM referral_links WHERE code=?",(code,)): break
+    await conn.execute("INSERT INTO referral_links(owner_id,code,created_at) VALUES(?,?,?)",(user_id,code,now_msk().isoformat())); await conn.commit()
+    row=await one(conn,"SELECT * FROM referral_links WHERE owner_id=?",(user_id,)); await conn.close(); return row
+
+async def referral_url(user_id):
+    link=await get_or_create_referral(user_id)
+    me=await bot.get_me()
+    return f"https://t.me/{me.username}?start=ref_{link['code']}"
+
+async def set_pending_referral(user_id, code):
+    conn=await db()
+    existing=await one(conn,"SELECT id FROM users WHERE id=?",(user_id,))
+    if existing:
+        await conn.close(); return False
+    ref=await one(conn,"SELECT * FROM referral_links WHERE code=?",(code,))
+    if not ref or ref["owner_id"]==user_id:
+        await conn.close(); return False
+    already=await one(conn,"SELECT id FROM referral_joins WHERE invited_user_id=?",(user_id,))
+    if already:
+        await conn.close(); return False
+    await conn.execute("INSERT OR REPLACE INTO pending_referrals(user_id,referral_code,created_at) VALUES(?,?,?)",(user_id,code,now_msk().isoformat()))
+    await conn.commit(); await conn.close(); return True
+
+async def finalize_referral(user):
+    conn=await db()
+    existing=await one(conn,"SELECT id FROM users WHERE id=?",(user.id,))
+    if existing:
+        await conn.close(); return False
+    pending=await one(conn,"SELECT * FROM pending_referrals WHERE user_id=?",(user.id,))
+    if not pending:
+        await conn.close(); return False
+    ref=await one(conn,"SELECT * FROM referral_links WHERE code=?",(pending["referral_code"],))
+    if not ref or ref["owner_id"]==user.id:
+        await conn.execute("DELETE FROM pending_referrals WHERE user_id=?",(user.id,)); await conn.commit(); await conn.close(); return False
+    duplicate=await one(conn,"SELECT id FROM referral_joins WHERE invited_user_id=?",(user.id,))
+    if duplicate:
+        await conn.execute("DELETE FROM pending_referrals WHERE user_id=?",(user.id,)); await conn.commit(); await conn.close(); return False
+    now=now_msk().isoformat()
+    await conn.execute("INSERT INTO referral_joins(referral_id,invited_user_id,verified_at) VALUES(?,?,?)",(ref["id"],user.id,now))
+    await conn.execute("DELETE FROM pending_referrals WHERE user_id=?",(user.id,))
+    await conn.commit(); await conn.close()
+    count_conn=await db(); count=await one(count_conn,"SELECT COUNT(*) c FROM referral_joins WHERE referral_id=?",(ref["id"],)); claim=await one(count_conn,"SELECT id FROM referral_claims WHERE referral_id=?",(ref["id"],)); await count_conn.close()
+    if count["c"]>=REFERRAL_GOAL and not claim:
+        conn=await db(); await conn.execute("INSERT INTO referral_claims(referral_id,owner_id,status,created_at) VALUES(?,?,?,?)",(ref["id"],ref["owner_id"],"pending",now)); await conn.commit(); await conn.close()
+        owner_username=f"@{user.username}" if user.username else "нет"
+        owner_conn=await db(); owner=await one(owner_conn,"SELECT username FROM users WHERE id=?",(ref["owner_id"],)); await owner_conn.close()
+        owner_name=f"@{owner['username']}" if owner and owner["username"] else str(ref["owner_id"])
+        try:
+            await bot.send_message(ref["owner_id"],"🎉 <b>Поздравляем! Вы достигли приза.</b>\n\nОжидайте модерации, после чего с вами свяжутся.")
+            await bot.send_message(ADMIN_ID,f"🔔 <b>Новая заявка (реферальная)</b>\n\n🔗 Реферальная ссылка: <code>{await referral_url(ref['owner_id'])}</code>\n👤 Юз: {owner_name}\n🆔 ID: <code>{ref['owner_id']}</code>\n👥 Рефералов: {count['c']}/{REFERRAL_GOAL}")
+        except Exception: pass
+    return True
+
+async def referral_info(m):
+    conn=await db(); ref=await one(conn,"SELECT * FROM referral_links WHERE owner_id=?",(m.from_user.id,));
+    if not ref:
+        await conn.close(); url=await referral_url(m.from_user.id); conn=await db(); ref=await one(conn,"SELECT * FROM referral_links WHERE owner_id=?",(m.from_user.id,))
+    count=await one(conn,"SELECT COUNT(*) c FROM referral_joins WHERE referral_id=?",(ref["id"],)); await conn.close()
+    url=await referral_url(m.from_user.id)
+    await m.answer(f"🔗 <b>Ваша реферальная ссылка:</b>\n<code>{url}</code>\n\n👥 <b>Рефералов: {count['c']}/{REFERRAL_GOAL}</b>",reply_markup=home_kb(m.from_user.id))
+
 def home_kb(uid):
-    kb=ReplyKeyboardBuilder(); [kb.button(text=TEXTS[k]) for k in ("catalog","reviews","support")]
+    kb=ReplyKeyboardBuilder(); [kb.button(text=TEXTS[k]) for k in ("catalog","reviews","support","referral")]
     if is_admin(uid): kb.button(text=TEXTS["admin"])
-    kb.adjust(1,2,1); return kb.as_markup(resize_keyboard=True)
+    kb.adjust(1,2,1,1,1); return kb.as_markup(resize_keyboard=True)
 def admin_kb():
-    kb=ReplyKeyboardBuilder(); [kb.button(text=TEXTS[k]) for k in ("stats","stock","broadcast","edit_text")]; kb.button(text="Назад"); kb.adjust(2,2,1); return kb.as_markup(resize_keyboard=True)
+    kb=ReplyKeyboardBuilder(); [kb.button(text=TEXTS[k]) for k in ("stats","stock","broadcast","edit_text")]; kb.button(text="🎁 Реферальные ссылки"); kb.button(text="Назад"); kb.adjust(2,2,1,1,1); return kb.as_markup(resize_keyboard=True)
 def catalog_kb():
     kb=ReplyKeyboardBuilder(); kb.button(text=TEXTS["accounts"]); kb.button(text=TEXTS["stars"]); kb.button(text="Назад"); kb.adjust(2,1); return kb.as_markup(resize_keyboard=True)
 def edit_kb():
@@ -131,12 +204,16 @@ def product_label(p, kind):
 @dp.callback_query(F.data=="sub:check")
 async def subscription_check(call):
     if await is_subscribed(call.from_user.id):
+        await finalize_referral(call.from_user)
         await save_user_id(call.from_user); await call.answer("Подписка подтверждена ✅"); await call.message.answer("Подписка подтверждена. Добро пожаловать!",reply_markup=home_kb(call.from_user.id))
     else: await call.answer("Подписка ещё не найдена. Подпишитесь на канал и нажмите кнопку ещё раз.",show_alert=True)
 @dp.message(CommandStart())
 async def start(m,state):
+    args=m.text.split(maxsplit=1)[1] if len(m.text.split(maxsplit=1))>1 else ""
+    if args.startswith("ref_"):
+        await set_pending_referral(m.from_user.id,args[4:])
     if not await subscription_gate(m): return
-    await state.clear(); await save_user(m); name=m.from_user.username or m.from_user.first_name or "пользователь"; await m.answer((await text("welcome")).format(name=name),reply_markup=home_kb(m.from_user.id))
+    await state.clear(); await finalize_referral(m.from_user); await save_user(m); name=m.from_user.username or m.from_user.first_name or "пользователь"; await m.answer((await text("welcome")).format(name=name),reply_markup=home_kb(m.from_user.id))
 @dp.message(Command("adm"))
 async def adm(m,state):
     if not await subscription_gate(m): return
@@ -156,11 +233,13 @@ async def router(m,state):
     if v==await text("catalog"): await m.answer(await text("choose_type"),reply_markup=catalog_kb())
     elif v==await text("reviews"): await m.answer("Отзывы:",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Открыть отзывы",url="https://t.me/repacrisov")]]))
     elif v==await text("support"): await m.answer("Поддержка:",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Написать в поддержку",url="https://t.me/fegote")]]))
+    elif v==await text("referral"): await referral_info(m)
     elif is_admin(m.from_user.id) and v==await text("admin"): await m.answer("Админ панель",reply_markup=admin_kb())
     elif is_admin(m.from_user.id) and v==TEXTS["stats"]: await stats(m)
     elif is_admin(m.from_user.id) and v==TEXTS["stock"]: await stock(m)
     elif is_admin(m.from_user.id) and v==TEXTS["broadcast"]: await state.set_state(Broadcast.text); await m.answer("Отправьте текст рассылки.\nДля отмены нажмите «Назад».")
     elif is_admin(m.from_user.id) and v==TEXTS["edit_text"]: await m.answer("Что изменить?",reply_markup=edit_kb())
+    elif is_admin(m.from_user.id) and v=="🎁 Реферальные ссылки": await admin_referrals(m)
     elif v==await text("accounts"): await products(m,"account")
     elif v==await text("stars"): await products(m,"stars")
 
@@ -251,6 +330,34 @@ async def delete_product(call):
     pid=int(call.data.split(":")[1]); conn=await db(); p=await one(conn,"SELECT * FROM products WHERE id=?",(pid,))
     if not p: await conn.close(); return await call.answer("Товар уже удалён",show_alert=True)
     await conn.execute("DELETE FROM products WHERE id=?",(pid,)); await conn.commit(); await conn.close(); await call.answer("Товар удалён со склада ✅"); await call.message.delete(); await stock(call.message)
+
+async def admin_referrals(m):
+    if not is_admin(m.from_user.id): return
+    conn=await db(); rows=await all_rows(conn,"SELECT r.*,u.username,u.first_name,(SELECT COUNT(*) FROM referral_joins j WHERE j.referral_id=r.id) c FROM referral_links r LEFT JOIN users u ON u.id=r.owner_id ORDER BY r.id DESC",()); await conn.close()
+    if not rows: return await m.answer("Реферальных ссылок пока нет.",reply_markup=admin_kb())
+    kb=InlineKeyboardBuilder()
+    for r in rows:
+        owner=f"@{r['username']}" if r['username'] else str(r['owner_id'])
+        kb.button(text=f"🔗 {owner} — {r['c']}/{REFERRAL_GOAL}",callback_data=f"ref:view:{r['id']}")
+    kb.button(text="⬅️ Назад",callback_data="back:admin"); kb.adjust(1); await m.answer("Все реферальные ссылки:",reply_markup=kb.as_markup())
+
+@dp.callback_query(F.data.startswith("ref:view:"))
+async def admin_ref_view(call):
+    if not is_admin(call.from_user.id): return
+    rid=int(call.data.split(":")[2]); conn=await db(); r=await one(conn,"SELECT r.*,u.username,u.first_name,(SELECT COUNT(*) FROM referral_joins j WHERE j.referral_id=r.id) c FROM referral_links r LEFT JOIN users u ON u.id=r.owner_id WHERE r.id=?",(rid,)); invited=await all_rows(conn,"SELECT j.invited_user_id,j.verified_at,u.username,u.first_name FROM referral_joins j LEFT JOIN users u ON u.id=j.invited_user_id WHERE j.referral_id=? ORDER BY j.id",(rid,)); await conn.close()
+    if not r: return await call.answer("Ссылка не найдена",show_alert=True)
+    owner=f"@{r['username']}" if r['username'] else str(r['owner_id'])
+    me=await bot.get_me(); url=f"https://t.me/{me.username}?start=ref_{r['code']}"
+    lines=[]
+    for i,u in enumerate(invited,1): lines.append(f"{i}. @{u['username']} — ID <code>{u['invited_user_id']}</code>" if u['username'] else f"{i}. ID <code>{u['invited_user_id']}</code>")
+    users_text="\n".join(lines) if lines else "пока никто"
+    text_msg=f"🔗 <b>Реферальная ссылка</b>\n<code>{url}</code>\n\n👤 Владелец: {owner}\n🆔 ID: <code>{r['owner_id']}</code>\n👥 Рефералов: <b>{r['c']}/{REFERRAL_GOAL}</b>\n\n<b>Пришедшие пользователи:</b>\n{users_text}"
+    await call.message.edit_text(text_msg,reply_markup=InlineKeyboardMarkup(inline_keyboard=[[inline_back("admin:referrals")]])); await call.answer()
+
+@dp.callback_query(F.data=="admin:referrals")
+async def admin_ref_back(call):
+    if not is_admin(call.from_user.id): return
+    await call.answer(); await admin_referrals(call.message)
 
 @dp.callback_query(F.data=="back:admin")
 async def back_admin(call,state):
