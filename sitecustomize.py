@@ -1,4 +1,14 @@
+import os
+from pathlib import Path
+
 import aiosqlite
+
+
+# Bothost keeps persistent bot data in /app/data.
+# Force the working directory to /app so the bot's existing
+# relative database path (data/shop.db) always points to that volume.
+if Path("/app").is_dir():
+    os.chdir("/app")
 
 
 async def _execute_fetchone(self, sql, parameters=()):
