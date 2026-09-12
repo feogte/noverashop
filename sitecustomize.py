@@ -4,7 +4,7 @@ import time
 from pathlib import Path
 
 import aiosqlite
-from aiogram import Dispatcher, F
+from aiogram import Dispatcher
 from aiogram.filters import StateFilter
 
 
@@ -97,16 +97,14 @@ def _install_runtime_fixes(dispatcher):
         await conn.commit()
         await conn.close()
 
-    awaitable_setup = setup_referral_rounds()
     try:
         loop = asyncio.get_running_loop()
-        loop.create_task(awaitable_setup)
+        loop.create_task(setup_referral_rounds())
     except RuntimeError:
-        awaitable_setup.close()
+        pass
 
     # Defense in depth: a referral can NEVER be finalized unless the invited
-    # user is currently subscribed. The normal handlers already check this,
-    # but this check also protects against accidental future call sites.
+    # user is currently subscribed.
     original_finalize = app.finalize_referral
 
     async def finalize_referral_rounds(user):
@@ -192,42 +190,34 @@ def _install_runtime_fixes(dispatcher):
         app.finalize_referral = finalize_referral_rounds
         app._noverashop_referral_rounds = True
 
-    # Referral section is temporarily unavailable. Keep the button in the
-    # main menu, but do not expose referral links/counters while maintenance
-    # is active.
+    # Maintenance mode for the referral button.
     async def referral_info_maintenance(m):
         await m.answer(
-            "🔧 <b>Раздел на тех. работах</b>\n\n"
+            "Раздел на тех работах\n\n"
             "Новости — @noverashop",
             reply_markup=app.home_kb(m.from_user.id),
         )
 
-    # The actual referral button is handled inside the generic `router`
-    # handler in main.py, so replacing app.referral_info is not enough.
-    # Register a dedicated higher-priority handler for the button itself.
     app.referral_info = referral_info_maintenance
 
-    async def referral_maintenance_handler(m):
-        if not await subscription_gate(m):
-            return
-        await referral_info_maintenance(m)
+    # The button is processed inside main.py's generic `router`. Replace that
+    # handler's callback itself so the maintenance response is guaranteed to
+    # run before the old referral_info branch can execute.
+    for handler in dispatcher.message.handlers:
+        callback = getattr(handler, "callback", None)
+        if getattr(callback, "__name__", "") == "router":
+            original_router = callback
 
-    dispatcher.message.register(
-        referral_maintenance_handler,
-        StateFilter(None),
-        F.text == texts["referral"],
-    )
-    for index, handler in enumerate(dispatcher.message.handlers):
-        if getattr(handler, "callback", None) is referral_maintenance_handler:
-            dispatcher.message.handlers.insert(0, dispatcher.message.handlers.pop(index))
+            async def router_maintenance(m, state, _original_router=original_router):
+                if m.text == texts["referral"]:
+                    if not await subscription_gate(m):
+                        return
+                    await referral_info_maintenance(m)
+                    return
+                await _original_router(m, state)
+
+            handler.callback = router_maintenance
             break
-
-    async def current_referral_count(conn, referral_id):
-        row = await conn.execute_fetchone(
-            "SELECT COUNT(*) FROM referral_joins WHERE referral_id=? AND id>COALESCE((SELECT claim_join_id FROM referral_claims WHERE referral_id=?),0)",
-            (referral_id, referral_id),
-        )
-        return row[0]
 
     async def admin_referrals(m):
         if not is_admin(m.from_user.id):
@@ -316,8 +306,8 @@ def _install_runtime_fixes(dispatcher):
         await state.set_state(EditText.key)
         await message.answer("Введите ключ сообщения: welcome, choose_type или другой ключ из списка")
 
-    dispatcher.message.register(change_button, StateFilter(None), F.text == texts["change_button"])
-    dispatcher.message.register(change_message, StateFilter(None), F.text == texts["change_message"])
+    dispatcher.message.register(change_button, StateFilter(None), __import__("aiogram").F.text == texts["change_button"])
+    dispatcher.message.register(change_message, StateFilter(None), __import__("aiogram").F.text == texts["change_message"])
 
     handlers = dispatcher.message.handlers
     for callback in (change_message, change_button):
