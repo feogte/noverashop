@@ -5,6 +5,8 @@ Telegram-магазин на Python + aiogram 3 + SQLite.
 ## Файлы
 
 - `main.py` — основной код бота.
+- `bootstrap.py` — гарантирует загрузку `sitecustomize.py` перед запуском бота.
+- `sitecustomize.py` — runtime-исправления и совместимость с окружением хостинга.
 - `requirements.txt` — зависимости.
 - `.env.example` — пример переменных окружения.
 - `Procfile` — запуск бота.
@@ -23,7 +25,7 @@ Telegram-магазин на Python + aiogram 3 + SQLite.
 
 ```bash
 pip install -r requirements.txt
-python main.py
+python bootstrap.py
 ```
 
 Бот использует polling, поэтому отдельный веб-сервер для Telegram webhook не нужен.
