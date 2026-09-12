@@ -97,8 +97,6 @@ def _install_runtime_fixes(dispatcher):
         await conn.commit()
         await conn.close()
 
-    # Run migration before polling starts. It only adds one column and fills
-    # the checkpoint; it never deletes users, products, purchases or referrals.
     awaitable_setup = setup_referral_rounds()
     try:
         loop = asyncio.get_running_loop()
@@ -106,11 +104,15 @@ def _install_runtime_fixes(dispatcher):
     except RuntimeError:
         awaitable_setup.close()
 
-    # Preserve the existing referral verification logic, then detect when a
-    # later round reaches 20 and advance the checkpoint exactly once.
+    # Defense in depth: a referral can NEVER be finalized unless the invited
+    # user is currently subscribed. The normal handlers already check this,
+    # but this check also protects against accidental future call sites.
     original_finalize = app.finalize_referral
 
     async def finalize_referral_rounds(user):
+        if not await app.is_subscribed(user.id):
+            return False
+
         result = await original_finalize(user)
         if not result:
             return result
@@ -160,8 +162,6 @@ def _install_runtime_fixes(dispatcher):
         await conn.commit()
         await conn.close()
 
-        # The first 20 are already announced by main.py. This notification is
-        # only needed for the second and subsequent completed rounds.
         if changed and checkpoint:
             try:
                 await bot_send_round_notice(app, owner_id, referral_id, new_checkpoint)
@@ -192,34 +192,24 @@ def _install_runtime_fixes(dispatcher):
         app.finalize_referral = finalize_referral_rounds
         app._noverashop_referral_rounds = True
 
+    # Referral section is temporarily unavailable. Keep the button in the
+    # main menu, but do not expose referral links/counters while maintenance
+    # is active.
+    async def referral_info_maintenance(m):
+        await m.answer(
+            "🔧 <b>Раздел на тех. работах</b>\n\n"
+            "Новости — @noverashop",
+            reply_markup=app.home_kb(m.from_user.id),
+        )
+
+    app.referral_info = referral_info_maintenance
+
     async def current_referral_count(conn, referral_id):
         row = await conn.execute_fetchone(
             "SELECT COUNT(*) FROM referral_joins WHERE referral_id=? AND id>COALESCE((SELECT claim_join_id FROM referral_claims WHERE referral_id=?),0)",
             (referral_id, referral_id),
         )
         return row[0]
-
-    async def referral_info(m):
-        conn = await app.db()
-        ref = await conn.execute_fetchone(
-            "SELECT * FROM referral_links WHERE owner_id=?", (m.from_user.id,)
-        )
-        if not ref:
-            await conn.close()
-            await app.referral_url(m.from_user.id)
-            conn = await app.db()
-            ref = await conn.execute_fetchone(
-                "SELECT * FROM referral_links WHERE owner_id=?", (m.from_user.id,)
-            )
-        count = await current_referral_count(conn, ref["id"])
-        await conn.close()
-        url = await app.referral_url(m.from_user.id)
-        await m.answer(
-            f"🔗 <b>Ваша реферальная ссылка:</b>\n<code>{url}</code>\n\n👥 <b>Рефералов: {count}/{app.REFERRAL_GOAL}</b>",
-            reply_markup=app.home_kb(m.from_user.id),
-        )
-
-    app.referral_info = referral_info
 
     async def admin_referrals(m):
         if not is_admin(m.from_user.id):
