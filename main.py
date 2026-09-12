@@ -193,13 +193,8 @@ def edit_kb():
     kb=ReplyKeyboardBuilder(); kb.button(text=TEXTS["change_button"]); kb.button(text=TEXTS["change_message"]); kb.button(text="Назад"); kb.adjust(1); return kb.as_markup(resize_keyboard=True)
 def inline_back(callback_data): return InlineKeyboardButton(text="⬅️ Назад",callback_data=callback_data)
 
-def product_label(p, kind):
-    name=p["name"].strip(); parts=name.split(); code=parts[0].lstrip("+") if parts else ""
-    flag=next((FLAGS.get(code[:n]) for n in (3,2,1) if FLAGS.get(code[:n])), "")
-    if kind=="account":
-        extra=" ".join(parts[1:])
-        return f"{flag} +{code}" + (f" {extra}" if extra else "") + f" {p['price_rub']:.0f}₽"
-    return f"{name} / {p['price_rub']:.0f}₽"
+def referral_maintenance_kb(uid):
+    return home_kb(uid)
 
 @dp.callback_query(F.data=="sub:check")
 async def subscription_check(call):
@@ -233,7 +228,8 @@ async def router(m,state):
     if v==await text("catalog"): await m.answer(await text("choose_type"),reply_markup=catalog_kb())
     elif v==await text("reviews"): await m.answer("Отзывы:",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Открыть отзывы",url="https://t.me/repacrisov")]]))
     elif v==await text("support"): await m.answer("Поддержка:",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Написать в поддержку",url="https://t.me/fegote")]]))
-    elif v==await text("referral"): await referral_info(m)
+    elif v==await text("referral"):
+        await m.answer("Раздел на тех работах\n\nНовости — @noverashop",reply_markup=referral_maintenance_kb(m.from_user.id))
     elif is_admin(m.from_user.id) and v==await text("admin"): await m.answer("Админ панель",reply_markup=admin_kb())
     elif is_admin(m.from_user.id) and v==TEXTS["stats"]: await stats(m)
     elif is_admin(m.from_user.id) and v==TEXTS["stock"]: await stock(m)
