@@ -140,21 +140,15 @@ def _install_runtime_fixes(dispatcher):
         app.finalize_referral = finalize_referral_rounds
         app._noverashop_referral_rounds = True
 
-    # TECHNICAL MAINTENANCE: the referral button is deliberately handled
-    # here by replacing the actual registered generic router callback.
-    # This does not touch referral tables or referral progress.
     async def referral_maintenance(m):
         if not await subscription_gate(m):
             return
         await m.answer(
-            "🔧 <b>Раздел на тех работах</b>\n\n"
+            "Раздел на тех работах\n\n"
             "Новости — @noverashop",
             reply_markup=app.home_kb(m.from_user.id),
         )
 
-    # Patch the router function itself. The generic handler's callback is
-    # replaced with a wrapper, so the old `referral_info(m)` branch can never
-    # execute for the referral button.
     original_router = getattr(app, "router", None)
     if original_router and not getattr(app, "_noverashop_router_patched", False):
         async def router_maintenance(m, state):
@@ -166,66 +160,6 @@ def _install_runtime_fixes(dispatcher):
             if getattr(handler, "callback", None) is original_router:
                 handler.callback = router_maintenance
         app._noverashop_router_patched = True
-
-    # Also keep a direct handler as a fallback and place it first.
-    if not getattr(app, "_noverashop_referral_handler", False):
-        dispatcher.message.register(referral_maintenance, StateFilter(None), F.text == texts["referral"])
-        for index, handler in enumerate(dispatcher.message.handlers):
-            if getattr(handler, "callback", None) is referral_maintenance:
-                dispatcher.message.handlers.insert(0, dispatcher.message.handlers.pop(index))
-                break
-        app._noverashop_referral_handler = True
-
-    async def admin_referrals(m):
-        if not is_admin(m.from_user.id):
-            return
-        conn = await app.db()
-        rows = await conn.execute_fetchall(
-            "SELECT r.*,u.username,u.first_name,(SELECT COUNT(*) FROM referral_joins j WHERE j.referral_id=r.id AND j.id>COALESCE((SELECT claim_join_id FROM referral_claims c WHERE c.referral_id=r.id),0)) c FROM referral_links r LEFT JOIN users u ON u.id=r.owner_id ORDER BY r.id DESC"
-        )
-        await conn.close()
-        if not rows:
-            return await m.answer("Реферальных ссылок пока нет.", reply_markup=app.admin_kb())
-        kb = app.InlineKeyboardBuilder()
-        for r in rows:
-            owner = f"@{r['username']}" if r['username'] else str(r['owner_id'])
-            kb.button(text=f"🔗 {owner} — {r['c']}/{app.REFERRAL_GOAL}", callback_data=f"ref:view:{r['id']}")
-        kb.button(text="⬅️ Назад", callback_data="back:admin")
-        kb.adjust(1)
-        await m.answer("Все реферальные ссылки:", reply_markup=kb.as_markup())
-
-    app.admin_referrals = admin_referrals
-
-    async def admin_ref_view(call):
-        if not is_admin(call.from_user.id):
-            return
-        rid = int(call.data.split(":")[2])
-        conn = await app.db()
-        r = await conn.execute_fetchone(
-            "SELECT r.*,u.username,u.first_name,(SELECT COUNT(*) FROM referral_joins j WHERE j.referral_id=r.id AND j.id>COALESCE((SELECT claim_join_id FROM referral_claims c WHERE c.referral_id=r.id),0)) c FROM referral_links r LEFT JOIN users u ON u.id=r.owner_id WHERE r.id=?",
-            (rid,),
-        )
-        invited = await conn.execute_fetchall(
-            "SELECT j.invited_user_id,j.verified_at,u.username,u.first_name FROM referral_joins j LEFT JOIN users u ON u.id=j.invited_user_id WHERE j.referral_id=? ORDER BY j.id",
-            (rid,),
-        )
-        await conn.close()
-        if not r:
-            return await call.answer("Ссылка не найдена", show_alert=True)
-        owner = f"@{r['username']}" if r['username'] else str(r['owner_id'])
-        me = await app.bot.get_me()
-        url = f"https://t.me/{me.username}?start=ref_{r['code']}"
-        lines = []
-        for i, u in enumerate(invited, 1):
-            lines.append(f"{i}. @{u['username']} — ID <code>{u['invited_user_id']}</code>" if u['username'] else f"{i}. ID <code>{u['invited_user_id']}</code>")
-        users_text = "\n".join(lines) if lines else "пока никто"
-        await call.message.edit_text(
-            f"🔗 <b>Реферальная ссылка</b>\n<code>{url}</code>\n\n👤 Владелец: {owner}\n🆔 ID: <code>{r['owner_id']}</code>\n👥 Рефералов в текущем раунде: <b>{r['c']}/{app.REFERRAL_GOAL}</b>\n\n<b>Пришедшие пользователи (вся история):</b>\n{users_text}",
-            reply_markup=app.InlineKeyboardMarkup(inline_keyboard=[[app.inline_back("admin:referrals")]]),
-        )
-        await call.answer()
-
-    app.admin_ref_view = admin_ref_view
 
     async def change_button(message, state):
         if not await subscription_gate(message):
@@ -245,10 +179,37 @@ def _install_runtime_fixes(dispatcher):
         await state.set_state(EditText.key)
         await message.answer("Введите ключ сообщения: welcome, choose_type или другой ключ из списка")
 
+    async def stock_handler(message, state):
+        if not await subscription_gate(message):
+            return
+        if not is_admin(message.from_user.id):
+            return
+        await app.stock(message)
+
+    async def edit_text_handler(message, state):
+        if not await subscription_gate(message):
+            return
+        if not is_admin(message.from_user.id):
+            return
+        await message.answer("Что изменить?", reply_markup=app.edit_kb())
+
+    async def stats_handler(message, state):
+        if not await subscription_gate(message):
+            return
+        if not is_admin(message.from_user.id):
+            return
+        await app.stats(message)
+
+    # Register explicit admin handlers and put them before the generic text router.
     dispatcher.message.register(change_button, StateFilter(None), F.text == texts["change_button"])
     dispatcher.message.register(change_message, StateFilter(None), F.text == texts["change_message"])
+    dispatcher.message.register(stock_handler, StateFilter(None), F.text == texts["stock"])
+    dispatcher.message.register(edit_text_handler, StateFilter(None), F.text == texts["edit_text"])
+    dispatcher.message.register(stats_handler, StateFilter(None), F.text == texts["stats"])
+
+    priority = (stats_handler, edit_text_handler, stock_handler, change_message, change_button, referral_maintenance)
     handlers = dispatcher.message.handlers
-    for callback in (change_message, change_button):
+    for callback in priority:
         for index, handler in enumerate(handlers):
             if getattr(handler, "callback", None) is callback:
                 handlers.insert(0, handlers.pop(index))
