@@ -1,4 +1,6 @@
+import asyncio
 import os
+import time
 from pathlib import Path
 
 import aiosqlite
@@ -34,8 +36,8 @@ if not hasattr(aiosqlite.Connection, "execute_fetchone"):
 _original_start_polling = Dispatcher.start_polling
 
 
-def _install_edit_text_fix(dispatcher):
-    if getattr(dispatcher, "_noverashop_edit_text_fix", False):
+def _install_runtime_fixes(dispatcher):
+    if getattr(dispatcher, "_noverashop_runtime_fixes", False):
         return
 
     try:
@@ -44,8 +46,49 @@ def _install_edit_text_fix(dispatcher):
         texts = app.TEXTS
         subscription_gate = app.subscription_gate
         is_admin = app.is_admin
+        original_db = app.db
     except Exception:
         return
+
+    # SQLite hardening for bursts of simultaneous users. Connections can
+    # wait briefly instead of immediately failing with "database is locked".
+    async def db_with_busy_timeout():
+        conn = await original_db()
+        await conn.execute("PRAGMA busy_timeout=10000")
+        return conn
+
+    if not getattr(app, "_noverashop_db_hardened", False):
+        app.db = db_with_busy_timeout
+        app._noverashop_db_hardened = True
+
+    # main.py currently updates the Telegram bot short description after
+    # every saved user. During a referral spike that creates one extra
+    # Telegram API request per user. Keep the counter accurate enough for
+    # the admin while coalescing bursts into at most one update per 15 sec.
+    original_description_update = app.update_user_count_description
+    description_lock = asyncio.Lock()
+    description_state = {"last": 0.0, "running": False}
+
+    async def throttled_description_update():
+        now = time.monotonic()
+        if now - description_state["last"] < 15:
+            return
+        if description_state["running"]:
+            return
+        async with description_lock:
+            now = time.monotonic()
+            if now - description_state["last"] < 15:
+                return
+            description_state["running"] = True
+            try:
+                await original_description_update()
+                description_state["last"] = time.monotonic()
+            finally:
+                description_state["running"] = False
+
+    if not getattr(app, "_noverashop_description_throttled", False):
+        app.update_user_count_description = throttled_description_update
+        app._noverashop_description_throttled = True
 
     async def change_button(message, state):
         if not await subscription_gate(message):
@@ -87,11 +130,11 @@ def _install_edit_text_fix(dispatcher):
                 handlers.insert(0, handlers.pop(index))
                 break
 
-    dispatcher._noverashop_edit_text_fix = True
+    dispatcher._noverashop_runtime_fixes = True
 
 
 async def _patched_start_polling(self, *args, **kwargs):
-    _install_edit_text_fix(self)
+    _install_runtime_fixes(self)
     return await _original_start_polling(self, *args, **kwargs)
 
 
