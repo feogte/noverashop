@@ -235,7 +235,8 @@ def _install_runtime_fixes(dispatcher):
 
     def product_label(product, kind=None):
         name = str(product["name"])
-        if kind == "account" or str(product.get("kind", "")) == "account":
+        product_kind = kind if kind is not None else product["kind"]
+        if product_kind == "account":
             flag = _account_flag(name)
             if flag and not name.startswith(flag):
                 return f"{flag} {name}"
