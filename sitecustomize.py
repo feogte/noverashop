@@ -202,7 +202,14 @@ def _install_runtime_fixes(dispatcher):
             reply_markup=app.home_kb(m.from_user.id),
         )
 
+    # The handler was registered in main.py before this runtime patch.
+    # Replacing app.referral_info alone does not change the callback already
+    # stored inside aiogram's HandlerObject, so replace that callback too.
     app.referral_info = referral_info_maintenance
+    for handler in dispatcher.message.handlers:
+        callback = getattr(handler, "callback", None)
+        if getattr(callback, "__name__", "") == "referral_info":
+            handler.callback = referral_info_maintenance
 
     async def current_referral_count(conn, referral_id):
         row = await conn.execute_fetchone(
