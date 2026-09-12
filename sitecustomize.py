@@ -202,14 +202,25 @@ def _install_runtime_fixes(dispatcher):
             reply_markup=app.home_kb(m.from_user.id),
         )
 
-    # The handler was registered in main.py before this runtime patch.
-    # Replacing app.referral_info alone does not change the callback already
-    # stored inside aiogram's HandlerObject, so replace that callback too.
+    # The actual referral button is handled inside the generic `router`
+    # handler in main.py, so replacing app.referral_info is not enough.
+    # Register a dedicated higher-priority handler for the button itself.
     app.referral_info = referral_info_maintenance
-    for handler in dispatcher.message.handlers:
-        callback = getattr(handler, "callback", None)
-        if getattr(callback, "__name__", "") == "referral_info":
-            handler.callback = referral_info_maintenance
+
+    async def referral_maintenance_handler(m):
+        if not await subscription_gate(m):
+            return
+        await referral_info_maintenance(m)
+
+    dispatcher.message.register(
+        referral_maintenance_handler,
+        StateFilter(None),
+        F.text == texts["referral"],
+    )
+    for index, handler in enumerate(dispatcher.message.handlers):
+        if getattr(handler, "callback", None) is referral_maintenance_handler:
+            dispatcher.message.handlers.insert(0, dispatcher.message.handlers.pop(index))
+            break
 
     async def current_referral_count(conn, referral_id):
         row = await conn.execute_fetchone(
