@@ -154,12 +154,34 @@ def _install_runtime_fixes(dispatcher):
         async def router_maintenance(m, state):
             if m.text == texts["referral"]:
                 return await referral_maintenance(m)
+            if is_admin(m.from_user.id):
+                if m.text == texts["stats"]:
+                    return await app.stats(m)
+                if m.text == texts["stock"]:
+                    return await app.stock(m)
+                if m.text == texts["edit_text"]:
+                    return await m.answer("Что изменить?", reply_markup=app.edit_kb())
+                if m.text == texts["change_button"]:
+                    await state.update_data(edit_mode="button")
+                    await state.set_state(EditText.key)
+                    return await m.answer("Введите ключ кнопки: catalog, reviews, support, admin, stats, stock, broadcast, edit_text, accounts или stars")
+                if m.text == texts["change_message"]:
+                    await state.update_data(edit_mode="message")
+                    await state.set_state(EditText.key)
+                    return await m.answer("Введите ключ сообщения: welcome, choose_type или другой ключ из списка")
             return await original_router(m, state)
         app.router = router_maintenance
         for handler in dispatcher.message.handlers:
             if getattr(handler, "callback", None) is original_router:
                 handler.callback = router_maintenance
         app._noverashop_router_patched = True
+
+    # main.py calls product_label() from stock/products, but the function is absent there.
+    # Use the product name as the safe display label.
+    if not hasattr(app, "product_label"):
+        def product_label(product, kind=None):
+            return str(product["name"])
+        app.product_label = product_label
 
     async def change_button(message, state):
         if not await subscription_gate(message):
