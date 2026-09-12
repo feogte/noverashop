@@ -4,22 +4,18 @@ import time
 from pathlib import Path
 
 import aiosqlite
-from aiogram import Dispatcher
+from aiogram import Dispatcher, F
 from aiogram.filters import StateFilter
-
 
 if Path("/app").is_dir():
     os.chdir("/app")
-
 
 async def _execute_fetchone(self, sql, parameters=()):
     async with self.execute(sql, parameters) as cursor:
         return await cursor.fetchone()
 
-
 if not hasattr(aiosqlite.Connection, "execute_fetchone"):
     aiosqlite.Connection.execute_fetchone = _execute_fetchone
-
 
 _original_start_polling = Dispatcher.start_polling
 
@@ -70,18 +66,13 @@ def _install_runtime_fixes(dispatcher):
         app.update_user_count_description = throttled_description_update
         app._noverashop_description_throttled = True
 
-    # Referral rounds: after every 20 verified referrals the counter starts
-    # a new round. Old referrals remain in the database for admin history.
     async def setup_referral_rounds():
         conn = await app.db()
         cols = await conn.execute_fetchall("PRAGMA table_info(referral_claims)")
         names = {row[1] for row in cols}
         if "claim_join_id" not in names:
             await conn.execute("ALTER TABLE referral_claims ADD COLUMN claim_join_id INTEGER")
-
-        claims = await conn.execute_fetchall(
-            "SELECT id, referral_id, claim_join_id FROM referral_claims"
-        )
+        claims = await conn.execute_fetchall("SELECT id, referral_id, claim_join_id FROM referral_claims")
         for claim in claims:
             if claim[2] is not None:
                 continue
@@ -90,10 +81,7 @@ def _install_runtime_fixes(dispatcher):
                 (claim[1], app.REFERRAL_GOAL - 1),
             )
             checkpoint = row[0] if row else 0
-            await conn.execute(
-                "UPDATE referral_claims SET claim_join_id=? WHERE id=?",
-                (checkpoint, claim[0]),
-            )
+            await conn.execute("UPDATE referral_claims SET claim_join_id=? WHERE id=?", (checkpoint, claim[0]))
         await conn.commit()
         await conn.close()
 
@@ -103,46 +91,29 @@ def _install_runtime_fixes(dispatcher):
     except RuntimeError:
         pass
 
-    # Defense in depth: a referral can NEVER be finalized unless the invited
-    # user is currently subscribed.
     original_finalize = app.finalize_referral
 
     async def finalize_referral_rounds(user):
         if not await app.is_subscribed(user.id):
             return False
-
         result = await original_finalize(user)
         if not result:
             return result
-
         conn = await app.db()
-        join = await conn.execute_fetchone(
-            "SELECT referral_id,id FROM referral_joins WHERE invited_user_id=?",
-            (user.id,),
-        )
+        join = await conn.execute_fetchone("SELECT referral_id,id FROM referral_joins WHERE invited_user_id=?", (user.id,))
         if not join:
             await conn.close()
             return result
-
         referral_id, join_id = join[0], join[1]
-        claim = await conn.execute_fetchone(
-            "SELECT owner_id,claim_join_id FROM referral_claims WHERE referral_id=?",
-            (referral_id,),
-        )
+        claim = await conn.execute_fetchone("SELECT owner_id,claim_join_id FROM referral_claims WHERE referral_id=?", (referral_id,))
         if not claim:
             await conn.close()
             return result
-
         checkpoint = claim[1] or 0
-        count = await conn.execute_fetchone(
-            "SELECT COUNT(*) FROM referral_joins WHERE referral_id=? AND id>?",
-            (referral_id, checkpoint),
-        )
-        current_count = count[0]
-        if current_count < app.REFERRAL_GOAL:
+        count = await conn.execute_fetchone("SELECT COUNT(*) FROM referral_joins WHERE referral_id=? AND id>?", (referral_id, checkpoint))
+        if count[0] < app.REFERRAL_GOAL:
             await conn.close()
             return result
-
         nth = await conn.execute_fetchone(
             "SELECT id FROM referral_joins WHERE referral_id=? AND id>? ORDER BY id LIMIT 1 OFFSET ?",
             (referral_id, checkpoint, app.REFERRAL_GOAL - 1),
@@ -150,8 +121,7 @@ def _install_runtime_fixes(dispatcher):
         new_checkpoint = nth[0] if nth else join_id
         now = app.now_msk().isoformat()
         cur = await conn.execute(
-            "UPDATE referral_claims SET claim_join_id=?, status='pending', created_at=? "
-            "WHERE referral_id=? AND COALESCE(claim_join_id,0) < ?",
+            "UPDATE referral_claims SET claim_join_id=?, status='pending', created_at=? WHERE referral_id=? AND COALESCE(claim_join_id,0) < ?",
             (new_checkpoint, now, referral_id, new_checkpoint),
         )
         changed = cur.rowcount
@@ -159,75 +129,59 @@ def _install_runtime_fixes(dispatcher):
         owner_id = claim[0]
         await conn.commit()
         await conn.close()
-
         if changed and checkpoint:
             try:
-                await bot_send_round_notice(app, owner_id, referral_id, new_checkpoint)
+                await app.bot.send_message(owner_id, "🎉 <b>Поздравляем! Вы снова достигли 20 рефералов.</b>\n\nОжидайте модерации, после чего с вами свяжутся.")
             except Exception:
                 pass
         return result
-
-    async def bot_send_round_notice(app_module, owner_id, referral_id, checkpoint):
-        me = await app_module.bot.get_me()
-        url = None
-        conn = await app_module.db()
-        ref = await conn.execute_fetchone(
-            "SELECT code FROM referral_links WHERE id=?", (referral_id,)
-        )
-        await conn.close()
-        if ref:
-            url = f"https://t.me/{me.username}?start=ref_{ref[0]}"
-        await app_module.bot.send_message(
-            owner_id,
-            "🎉 <b>Поздравляем! Вы снова достигли 20 рефералов.</b>\n\nОжидайте модерации, после чего с вами свяжутся."
-        )
-        await app_module.bot.send_message(
-            app_module.ADMIN_ID,
-            f"🔔 <b>Новая заявка (реферальная)</b>\n\n🔗 Реферальная ссылка: <code>{url or 'нет'}</code>\n🆔 ID владельца: <code>{owner_id}</code>\n👥 Новый раунд: {app_module.REFERRAL_GOAL}/{app_module.REFERRAL_GOAL}"
-        )
 
     if not getattr(app, "_noverashop_referral_rounds", False):
         app.finalize_referral = finalize_referral_rounds
         app._noverashop_referral_rounds = True
 
-    # Maintenance mode for the referral button.
-    async def referral_info_maintenance(m):
+    # TECHNICAL MAINTENANCE: the referral button is deliberately handled
+    # here by replacing the actual registered generic router callback.
+    # This does not touch referral tables or referral progress.
+    async def referral_maintenance(m):
+        if not await subscription_gate(m):
+            return
         await m.answer(
-            "Раздел на тех работах\n\n"
+            "🔧 <b>Раздел на тех работах</b>\n\n"
             "Новости — @noverashop",
             reply_markup=app.home_kb(m.from_user.id),
         )
 
-    app.referral_info = referral_info_maintenance
+    # Patch the router function itself. The generic handler's callback is
+    # replaced with a wrapper, so the old `referral_info(m)` branch can never
+    # execute for the referral button.
+    original_router = getattr(app, "router", None)
+    if original_router and not getattr(app, "_noverashop_router_patched", False):
+        async def router_maintenance(m, state):
+            if m.text == texts["referral"]:
+                return await referral_maintenance(m)
+            return await original_router(m, state)
+        app.router = router_maintenance
+        for handler in dispatcher.message.handlers:
+            if getattr(handler, "callback", None) is original_router:
+                handler.callback = router_maintenance
+        app._noverashop_router_patched = True
 
-    # The button is processed inside main.py's generic `router`. Replace that
-    # handler's callback itself so the maintenance response is guaranteed to
-    # run before the old referral_info branch can execute.
-    for handler in dispatcher.message.handlers:
-        callback = getattr(handler, "callback", None)
-        if getattr(callback, "__name__", "") == "router":
-            original_router = callback
-
-            async def router_maintenance(m, state, _original_router=original_router):
-                if m.text == texts["referral"]:
-                    if not await subscription_gate(m):
-                        return
-                    await referral_info_maintenance(m)
-                    return
-                await _original_router(m, state)
-
-            handler.callback = router_maintenance
-            break
+    # Also keep a direct handler as a fallback and place it first.
+    if not getattr(app, "_noverashop_referral_handler", False):
+        dispatcher.message.register(referral_maintenance, StateFilter(None), F.text == texts["referral"])
+        for index, handler in enumerate(dispatcher.message.handlers):
+            if getattr(handler, "callback", None) is referral_maintenance:
+                dispatcher.message.handlers.insert(0, dispatcher.message.handlers.pop(index))
+                break
+        app._noverashop_referral_handler = True
 
     async def admin_referrals(m):
         if not is_admin(m.from_user.id):
             return
         conn = await app.db()
         rows = await conn.execute_fetchall(
-            "SELECT r.*,u.username,u.first_name," 
-            "(SELECT COUNT(*) FROM referral_joins j WHERE j.referral_id=r.id "
-            "AND j.id>COALESCE((SELECT claim_join_id FROM referral_claims c WHERE c.referral_id=r.id),0)) c "
-            "FROM referral_links r LEFT JOIN users u ON u.id=r.owner_id ORDER BY r.id DESC"
+            "SELECT r.*,u.username,u.first_name,(SELECT COUNT(*) FROM referral_joins j WHERE j.referral_id=r.id AND j.id>COALESCE((SELECT claim_join_id FROM referral_claims c WHERE c.referral_id=r.id),0)) c FROM referral_links r LEFT JOIN users u ON u.id=r.owner_id ORDER BY r.id DESC"
         )
         await conn.close()
         if not rows:
@@ -248,15 +202,11 @@ def _install_runtime_fixes(dispatcher):
         rid = int(call.data.split(":")[2])
         conn = await app.db()
         r = await conn.execute_fetchone(
-            "SELECT r.*,u.username,u.first_name," 
-            "(SELECT COUNT(*) FROM referral_joins j WHERE j.referral_id=r.id "
-            "AND j.id>COALESCE((SELECT claim_join_id FROM referral_claims c WHERE c.referral_id=r.id),0)) c "
-            "FROM referral_links r LEFT JOIN users u ON u.id=r.owner_id WHERE r.id=?",
+            "SELECT r.*,u.username,u.first_name,(SELECT COUNT(*) FROM referral_joins j WHERE j.referral_id=r.id AND j.id>COALESCE((SELECT claim_join_id FROM referral_claims c WHERE c.referral_id=r.id),0)) c FROM referral_links r LEFT JOIN users u ON u.id=r.owner_id WHERE r.id=?",
             (rid,),
         )
         invited = await conn.execute_fetchall(
-            "SELECT j.invited_user_id,j.verified_at,u.username,u.first_name FROM referral_joins j "
-            "LEFT JOIN users u ON u.id=j.invited_user_id WHERE j.referral_id=? ORDER BY j.id",
+            "SELECT j.invited_user_id,j.verified_at,u.username,u.first_name FROM referral_joins j LEFT JOIN users u ON u.id=j.invited_user_id WHERE j.referral_id=? ORDER BY j.id",
             (rid,),
         )
         await conn.close()
@@ -267,22 +217,11 @@ def _install_runtime_fixes(dispatcher):
         url = f"https://t.me/{me.username}?start=ref_{r['code']}"
         lines = []
         for i, u in enumerate(invited, 1):
-            lines.append(
-                f"{i}. @{u['username']} — ID <code>{u['invited_user_id']}</code>"
-                if u['username'] else f"{i}. ID <code>{u['invited_user_id']}</code>"
-            )
+            lines.append(f"{i}. @{u['username']} — ID <code>{u['invited_user_id']}</code>" if u['username'] else f"{i}. ID <code>{u['invited_user_id']}</code>")
         users_text = "\n".join(lines) if lines else "пока никто"
-        text_msg = (
-            f"🔗 <b>Реферальная ссылка</b>\n<code>{url}</code>\n\n"
-            f"👤 Владелец: {owner}\n🆔 ID: <code>{r['owner_id']}</code>\n"
-            f"👥 Рефералов в текущем раунде: <b>{r['c']}/{app.REFERRAL_GOAL}</b>\n\n"
-            f"<b>Пришедшие пользователи (вся история):</b>\n{users_text}"
-        )
         await call.message.edit_text(
-            text_msg,
-            reply_markup=app.InlineKeyboardMarkup(
-                inline_keyboard=[[app.inline_back("admin:referrals")]]
-            ),
+            f"🔗 <b>Реферальная ссылка</b>\n<code>{url}</code>\n\n👤 Владелец: {owner}\n🆔 ID: <code>{r['owner_id']}</code>\n👥 Рефералов в текущем раунде: <b>{r['c']}/{app.REFERRAL_GOAL}</b>\n\n<b>Пришедшие пользователи (вся история):</b>\n{users_text}",
+            reply_markup=app.InlineKeyboardMarkup(inline_keyboard=[[app.inline_back("admin:referrals")]]),
         )
         await call.answer()
 
@@ -306,9 +245,8 @@ def _install_runtime_fixes(dispatcher):
         await state.set_state(EditText.key)
         await message.answer("Введите ключ сообщения: welcome, choose_type или другой ключ из списка")
 
-    dispatcher.message.register(change_button, StateFilter(None), __import__("aiogram").F.text == texts["change_button"])
-    dispatcher.message.register(change_message, StateFilter(None), __import__("aiogram").F.text == texts["change_message"])
-
+    dispatcher.message.register(change_button, StateFilter(None), F.text == texts["change_button"])
+    dispatcher.message.register(change_message, StateFilter(None), F.text == texts["change_message"])
     handlers = dispatcher.message.handlers
     for callback in (change_message, change_button):
         for index, handler in enumerate(handlers):
@@ -322,6 +260,5 @@ def _install_runtime_fixes(dispatcher):
 async def _patched_start_polling(self, *args, **kwargs):
     _install_runtime_fixes(self)
     return await _original_start_polling(self, *args, **kwargs)
-
 
 Dispatcher.start_polling = _patched_start_polling
