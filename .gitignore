@@ -1,0 +1,25 @@
+# Базы данных SQLite и локальные файлы БД
+*.db
+*.sqlite
+*.sqlite3
+data/
+bot_database.db
+
+# Сессии Telegram / Pyrogram / Telethon
+sessions/
+*.session
+*.session-journal
+
+# Файлы окружения с токенами и ключами
+.env
+
+# Кэш Python и виртуальное окружение
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+
+# Логи работы бота
+*.log
+logs/
