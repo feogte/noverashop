@@ -10,29 +10,27 @@ import aiosqlite
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart, StateFilter
+from aiogram.filters import CommandStart, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
-from dotenv import load_dotenv
 
 from pyrogram import Client, filters
 from pyrogram.errors import AuthKeyUnregistered, UserDeactivated, SessionPasswordNeeded
 
-load_dotenv()
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("8887215013:AAHnKafRzAr6SjWyJL-9EhYNg6rHKN_M2t4")
-API_ID = int(os.getenv("API_ID", "31799721"))
-API_HASH = os.getenv("API_HASH", "eb2181220b3b8a0b6a7f93cd8075a559")
+# =====================================================================
+# ВСТАВЬТЕ ВАШ ТОКЕН СЮДА:
+TOKEN = "8887215013:AAFL4UG7owG2s-yuNXEVFMUkmwJLKGtORbQ"
+# =====================================================================
 
-if not TOKEN:
-    raise RuntimeError("Telegram bot token was not provided")
+API_ID = 31799721
+API_HASH = "eb2181220b3b8a0b6a7f93cd8075a559"
+ADMIN_ID = 8872934046
+CHANNEL_ID = -1003922108499
 
-ADMIN_ID = int(os.getenv("ADMIN_ID", "8872934046"))
-CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1003922108499"))
-
-DB_PATH = os.getenv("DB_PATH", "data/shop.db")
+DB_PATH = "data/shop.db"
 Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 Path("sessions").mkdir(parents=True, exist_ok=True)
 
@@ -43,7 +41,6 @@ MSK = ZoneInfo("Europe/Moscow")
 def is_admin(uid): return uid == ADMIN_ID
 def now_msk(): return datetime.now(MSK)
 
-# --- ГЕНЕРАТОР ВСЕХ ФЛАГОВ МИРА ПО КОДУ ТЕЛЕФОНА ---
 PREFIX_TO_ISO = {
     "1": "US", "7": "RU", "77": "KZ", "76": "KZ", "20": "EG", "27": "ZA",
     "30": "GR", "31": "NL", "32": "BE", "33": "FR", "34": "ES", "36": "HU",
@@ -106,8 +103,28 @@ async def check_sub(user_id: int) -> bool:
     except Exception:
         return False
 
+async def is_valid_referral_user(user_id: int) -> bool:
+    """Проверка аккаунта на бота-пустышку."""
+    try:
+        user = await bot.get_chat(user_id)
+        photos = await bot.get_user_profile_photos(user_id, limit=1)
+        has_photo = photos.total_count > 0
+        has_username = bool(user.username)
+        if not has_photo and not has_username:
+            return False
+        return True
+    except Exception:
+        return False
+
 async def db():
-    conn = await aiosqlite.connect(DB_PATH); conn.row_factory = aiosqlite.Row; return conn
+    conn = await aiosqlite.connect(DB_PATH, timeout=60.0)
+    conn.row_factory = aiosqlite.Row
+    await conn.execute("PRAGMA journal_mode=WAL;")
+    await conn.execute("PRAGMA synchronous=NORMAL;")
+    await conn.execute("PRAGMA busy_timeout=60000;")
+    await conn.execute("PRAGMA cache_size=-64000;")
+    await conn.execute("PRAGMA temp_store=MEMORY;")
+    return conn
 
 async def one(conn, sql, params=()):
     cur = await conn.execute(sql, params)
@@ -122,14 +139,22 @@ async def all_rows(conn, sql, params=()):
 async def init_db():
     conn = await db()
     await conn.executescript("""
-    CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, created_at TEXT NOT NULL, referrer_id INTEGER, ref_count INTEGER DEFAULT 0);
     CREATE TABLE IF NOT EXISTS products(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, name TEXT NOT NULL, price_rub REAL NOT NULL, price_stars INTEGER NOT NULL, price_kzt REAL NOT NULL DEFAULT 0, stock INTEGER NOT NULL DEFAULT 0, sales INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, file_id TEXT, phone TEXT, session_path TEXT);
     CREATE TABLE IF NOT EXISTS purchases(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, product_id INTEGER NOT NULL, product_name TEXT NOT NULL, payment TEXT NOT NULL, amount REAL NOT NULL, screenshot_file_id TEXT, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS ref_accounts(id INTEGER PRIMARY KEY AUTOINCREMENT, file_id TEXT, session_path TEXT, phone TEXT, created_at TEXT NOT NULL);
+    
+    CREATE INDEX IF NOT EXISTS idx_users_referrer_id ON users(referrer_id);
+    CREATE INDEX IF NOT EXISTS idx_users_ref_count ON users(ref_count);
+    CREATE INDEX IF NOT EXISTS idx_products_kind_stock ON products(kind, stock);
+    CREATE INDEX IF NOT EXISTS idx_purchases_status ON purchases(status);
     """)
-    try:
-        await conn.execute("ALTER TABLE products ADD COLUMN price_kzt REAL NOT NULL DEFAULT 0")
-    except Exception:
-        pass
+    try: await conn.execute("ALTER TABLE products ADD COLUMN price_kzt REAL NOT NULL DEFAULT 0")
+    except Exception: pass
+    try: await conn.execute("ALTER TABLE users ADD COLUMN referrer_id INTEGER")
+    except Exception: pass
+    try: await conn.execute("ALTER TABLE users ADD COLUMN ref_count INTEGER DEFAULT 0")
+    except Exception: pass
     await conn.commit(); await conn.close()
 def home_kb(uid):
     kb = ReplyKeyboardBuilder()
@@ -146,10 +171,12 @@ def admin_kb():
     kb = ReplyKeyboardBuilder()
     kb.button(text="Статистика")
     kb.button(text="Склад")
+    kb.button(text="Реф.аккаунты")
     kb.button(text="🎁 Подарить аккаунт")
+    kb.button(text="🔗 Реф. ссылки")
     kb.button(text="Рассылка")
     kb.button(text="Назад")
-    kb.adjust(2, 1, 1, 1)
+    kb.adjust(2, 2, 2, 1)
     return kb.as_markup(resize_keyboard=True)
 
 def catalog_kb():
@@ -178,6 +205,9 @@ class GiftAccount(StatesGroup):
     session_file = State()
     phone = State()
     confirm = State()
+
+class AddRefAccount(StatesGroup):
+    session_file = State()
 
 class EditStockGroup(StatesGroup):
     new_price = State()
@@ -208,11 +238,42 @@ async def send_sub_request(message_or_call):
 async def recheck_sub(call: CallbackQuery, state: FSMContext):
     if await check_sub(call.from_user.id):
         conn = await db()
-        await conn.execute(
-            "INSERT OR IGNORE INTO users VALUES(?,?,?,?)",
-            (call.from_user.id, call.from_user.username, call.from_user.first_name, now_msk().isoformat())
-        )
-        await conn.commit()
+        u = await one(conn, "SELECT * FROM users WHERE id=?", (call.from_user.id,))
+        if not u:
+            await conn.execute(
+                "INSERT OR IGNORE INTO users (id, username, first_name, created_at) VALUES(?,?,?,?)",
+                (call.from_user.id, call.from_user.username, call.from_user.first_name, now_msk().isoformat())
+            )
+            await conn.commit()
+        else:
+            ref_id = u["referrer_id"]
+            if ref_id and u["ref_count"] == -1:
+                if await is_valid_referral_user(call.from_user.id):
+                    ref_user = await one(conn, "SELECT * FROM users WHERE id=?", (ref_id,))
+                    if ref_user:
+                        new_cnt = (ref_user["ref_count"] or 0) + 1
+                        await conn.execute("UPDATE users SET ref_count=? WHERE id=?", (new_cnt, ref_id))
+                        await conn.execute("UPDATE users SET ref_count=0 WHERE id=?", (call.from_user.id,))
+                        await conn.commit()
+                        
+                        if new_cnt >= 30:
+                            await conn.execute("UPDATE users SET ref_count=0 WHERE id=?", (ref_id,))
+                            await conn.commit()
+                            gift_kb = InlineKeyboardMarkup(inline_keyboard=[
+                                [InlineKeyboardButton(text="Забрать подарок", callback_data="claim_ref_gift")]
+                            ])
+                            try:
+                                await bot.send_message(ref_id, "Вы достигли 30 рефералов!\nваш подарок ниже", reply_markup=gift_kb)
+                            except Exception: pass
+
+                            ref_tag = f"@{ref_user['username']}" if ref_user['username'] else f"ID {ref_user['id']}"
+                            try:
+                                await bot.send_message(ADMIN_ID, f"{ref_tag} - добил 30 рефералов!")
+                            except Exception: pass
+                else:
+                    await conn.execute("UPDATE users SET ref_count=0 WHERE id=?", (call.from_user.id,))
+                    await conn.commit()
+
         await conn.close()
 
         await call.answer("Спасибо за подписку! 🎉", show_alert=True)
@@ -224,12 +285,60 @@ async def recheck_sub(call: CallbackQuery, state: FSMContext):
         await call.answer("Вы всё еще не подписаны на канал! ❌", show_alert=True)
 
 @dp.message(CommandStart())
-async def start(m: Message, state: FSMContext):
+async def start(m: Message, command: CommandObject, state: FSMContext):
     await state.clear()
-    
+    args = command.args
     conn = await db()
-    await conn.execute("INSERT OR IGNORE INTO users VALUES(?,?,?,?)", (m.from_user.id, m.from_user.username, m.from_user.first_name, now_msk().isoformat()))
-    await conn.commit(); await conn.close()
+    u = await one(conn, "SELECT * FROM users WHERE id=?", (m.from_user.id,))
+    
+    if not u:
+        referrer_id = None
+        if args and args.isdigit():
+            possible_ref = int(args)
+            if possible_ref != m.from_user.id:
+                referrer_id = possible_ref
+
+        is_subbed = await check_sub(m.from_user.id)
+        is_valid = await is_valid_referral_user(m.from_user.id)
+
+        if is_subbed and referrer_id and is_valid:
+            await conn.execute(
+                "INSERT INTO users(id, username, first_name, created_at, referrer_id, ref_count) VALUES(?,?,?,?,?,0)",
+                (m.from_user.id, m.from_user.username, m.from_user.first_name, now_msk().isoformat(), referrer_id)
+            )
+            ref_user = await one(conn, "SELECT * FROM users WHERE id=?", (referrer_id,))
+            if ref_user:
+                new_cnt = (ref_user["ref_count"] or 0) + 1
+                await conn.execute("UPDATE users SET ref_count=? WHERE id=?", (new_cnt, referrer_id))
+                await conn.commit()
+                
+                if new_cnt >= 30:
+                    await conn.execute("UPDATE users SET ref_count=0 WHERE id=?", (referrer_id,))
+                    await conn.commit()
+                    gift_kb = InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="Забрать подарок", callback_data="claim_ref_gift")]
+                    ])
+                    try:
+                        await bot.send_message(referrer_id, "Вы достигли 30 рефералов!\nваш подарок ниже", reply_markup=gift_kb)
+                    except Exception: pass
+
+                    ref_tag = f"@{ref_user['username']}" if ref_user['username'] else f"ID {ref_user['id']}"
+                    try:
+                        await bot.send_message(ADMIN_ID, f"{ref_tag} - добил 30 рефералов!")
+                    except Exception: pass
+        elif not is_subbed and referrer_id:
+            await conn.execute(
+                "INSERT INTO users(id, username, first_name, created_at, referrer_id, ref_count) VALUES(?,?,?,?,?,-1)",
+                (m.from_user.id, m.from_user.username, m.from_user.first_name, now_msk().isoformat(), referrer_id)
+            )
+            await conn.commit()
+        else:
+            await conn.execute(
+                "INSERT INTO users(id, username, first_name, created_at, referrer_id, ref_count) VALUES(?,?,?,?,NULL,0)",
+                (m.from_user.id, m.from_user.username, m.from_user.first_name, now_msk().isoformat())
+            )
+            await conn.commit()
+    await conn.close()
 
     if not await check_sub(m.from_user.id):
         return await send_sub_request(m)
@@ -260,8 +369,20 @@ async def open_support(m: Message):
 @dp.message(F.text == "🎁 Рефералка")
 async def open_ref(m: Message):
     if not await check_sub(m.from_user.id): return await send_sub_request(m)
-    await m.answer("Раздел на тех работах\n\nНовости — @noverashop", reply_markup=home_kb(m.from_user.id))
-
+    bot_info = await bot.get_me()
+    ref_link = f"https://t.me/{bot_info.username}?start={m.from_user.id}"
+    
+    conn = await db()
+    u = await one(conn, "SELECT * FROM users WHERE id=?", (m.from_user.id,))
+    await conn.close()
+    
+    count = u["ref_count"] if (u and u["ref_count"] and u["ref_count"] > 0) else 0
+    text = (
+        f"Ваша ссылка - {ref_link}\n"
+        f"приглашено: {count}/30\n\n"
+        f"*без подписки на канал реферал не засчитывается*"
+    )
+    await m.answer(text, reply_markup=home_kb(m.from_user.id))
 @dp.message(F.text == "Аккаунты")
 async def show_accounts(m: Message):
     if not await check_sub(m.from_user.id): return await send_sub_request(m)
@@ -280,14 +401,12 @@ async def products(m: Message, kind: str):
         return await m.answer("Товаров в наличии нет.", reply_markup=catalog_kb())
     
     kb = InlineKeyboardBuilder()
-    
     if kind == "account":
         grouped = {}
         for p in rows:
             code = extract_code_prefix(p["phone"] or p["name"])
             if code not in grouped:
                 grouped[code] = p
-        
         for code, p in grouped.items():
             flag = get_flag(code)
             btn_text = f"{flag}{code} [{p['price_rub']:.0f}₽]"
@@ -300,14 +419,16 @@ async def products(m: Message, kind: str):
         
     kb.adjust(1)
     await m.answer("Выберите товар для покупки:", reply_markup=kb.as_markup())
+
 @dp.callback_query(F.data.startswith("buy_prefix:"))
 async def buy_prefix_select(call: CallbackQuery):
     if not await check_sub(call.from_user.id): return await send_sub_request(call)
     await call.answer()
     prefix = call.data.split(":", 1)[1]
+    raw_digits = re.sub(r"\D", "", prefix)
     
     conn = await db()
-    prod = await one(conn, "SELECT * FROM products WHERE kind='account' AND stock>0 AND (phone LIKE ? OR name LIKE ?) LIMIT 1", (f"{prefix}%", f"{prefix}%"))
+    prod = await one(conn, "SELECT * FROM products WHERE kind='account' AND stock>0 AND (phone LIKE ? OR name LIKE ? OR phone LIKE ?) LIMIT 1", (f"{prefix}%", f"{prefix}%", f"{raw_digits}%"))
     await conn.close()
 
     if not prod:
@@ -397,15 +518,8 @@ async def process_payment_proof(m: Message, state: FSMContext):
         return await m.answer("Товар закончился.")
 
     photo_id = m.photo[-1].file_id if m.photo else m.document.file_id
-    if pay_type == "rub":
-        amount = prod["price_rub"]
-        pay_symbol = "₽"
-    elif pay_type == "kzt":
-        amount = prod["price_kzt"]
-        pay_symbol = "₸"
-    else:
-        amount = prod["price_stars"]
-        pay_symbol = "⭐"
+    amount = prod["price_rub"] if pay_type == "rub" else (prod["price_kzt"] if pay_type == "kzt" else prod["price_stars"])
+    pay_symbol = "₽" if pay_type == "rub" else ("₸" if pay_type == "kzt" else "⭐")
 
     cur = await conn.execute(
         "INSERT INTO purchases(user_id, product_id, product_name, payment, amount, screenshot_file_id, status, created_at) VALUES(?,?,?,?,?,?,'pending',?)",
@@ -488,7 +602,6 @@ async def claim_account(call: CallbackQuery):
     
     conn = await db()
     purch = await one(conn, "SELECT * FROM purchases WHERE id=?", (purch_id,))
-    
     if not purch:
         await conn.close()
         return await call.message.answer("Заявка на покупку не найдена.")
@@ -503,7 +616,17 @@ async def claim_account(call: CallbackQuery):
         await call.message.answer("⏳ <i>Подключаемся к аккаунту...</i>")
         asyncio.create_task(safe_listen_for_login_code(session_file, call.from_user.id, user_mention))
     else:
-        await call.message.answer("⚠️ Файл `.session` для этого аккаунта не найден на сервере.")
+        fallback_session = None
+        if os.path.exists("sessions"):
+            for f in os.listdir("sessions"):
+                if f.endswith(".session"):
+                    fallback_session = os.path.join("sessions", f)
+                    break
+        if fallback_session:
+            await call.message.answer("⏳ <i>Подключаемся к аккаунту...</i>")
+            asyncio.create_task(safe_listen_for_login_code(fallback_session, call.from_user.id, user_mention))
+        else:
+            await call.message.answer("⚠️ Файл .session не найден на сервере. Обратитесь в поддержку.")
 
 @dp.callback_query(F.data.startswith("claim_gift:"))
 async def claim_gift_account(call: CallbackQuery):
@@ -526,6 +649,28 @@ async def claim_gift_account(call: CallbackQuery):
     else:
         await call.message.answer("⚠️ Файл `.session` не найден на сервере.")
 
+@dp.callback_query(F.data == "claim_ref_gift")
+async def claim_ref_gift(call: CallbackQuery):
+    await call.answer()
+    conn = await db()
+    ref_acc = await one(conn, "SELECT * FROM ref_accounts ORDER BY id ASC LIMIT 1")
+    if not ref_acc:
+        await conn.close()
+        return await call.message.answer("Запас реферальных аккаунтов временно пуст. Обратитесь к администратору!")
+
+    await conn.execute("DELETE FROM ref_accounts WHERE id=?", (ref_acc["id"],))
+    await conn.commit()
+    await conn.close()
+
+    session_file = ref_acc["session_path"]
+    user_mention = f"@{call.from_user.username}" if call.from_user.username else f"ID {call.from_user.id}"
+
+    if session_file and os.path.exists(session_file):
+        await call.message.answer("мы пришлем вам код как только он придет")
+        asyncio.create_task(safe_listen_for_login_code(session_file, call.from_user.id, user_mention))
+    else:
+        await call.message.answer("⚠️ Файл `.session` не найден на сервере.")
+
 @dp.callback_query(F.data.startswith("more_code:"))
 async def req_more_code(call: CallbackQuery):
     await call.answer("Ожидаем ещё один код...")
@@ -538,19 +683,11 @@ async def safe_listen_for_login_code(session_path: str, user_id: int, user_menti
     session_name = Path(session_path).stem
     session_dir = str(Path(session_path).parent)
     
-    client = Client(
-        session_name, 
-        api_id=API_ID, 
-        api_hash=API_HASH, 
-        workdir=session_dir,
-        in_memory=False
-    )
-    
+    client = Client(session_name, api_id=API_ID, api_hash=API_HASH, workdir=session_dir, in_memory=False)
     login_notified = False
 
     try:
         await client.start()
-        
         me = await client.get_me()
         phone_number = f"+{me.phone_number}" if (me and me.phone_number) else "Номер не определен"
 
@@ -563,14 +700,9 @@ async def safe_listen_for_login_code(session_path: str, user_id: int, user_menti
         @client.on_message(filters.me | filters.service | filters.private)
         async def code_handler(cli, message):
             nonlocal login_notified
-            
             if not login_notified and ("устройство" in (message.text or "").lower() or "вход" in (message.text or "").lower() or (message.from_user and message.from_user.is_self)):
                 login_notified = True
-                admin_text = (
-                    f"🔔 <b>Вход в аккаунт произведен!</b>\n\n"
-                    f"📱 Аккаунт: <code>{phone_number}</code>\n"
-                    f"👤 Покупатель/Получатель: {user_mention}"
-                )
+                admin_text = f"🔔 <b>Вход в аккаунт произведен!</b>\n\n📱 Аккаунт: <code>{phone_number}</code>\n👤 Покупатель: {user_mention}"
                 try: await bot.send_message(ADMIN_ID, admin_text)
                 except Exception: pass
 
@@ -581,6 +713,8 @@ async def safe_listen_for_login_code(session_path: str, user_id: int, user_menti
                     try:
                         await bot.send_message(user_id, f"🔑 <b>Ваш код авторизации:</b> <code>{found_code}</code>")
                         
+                        await asyncio.sleep(12)
+                        
                         kb_more = InlineKeyboardMarkup(inline_keyboard=[
                             [InlineKeyboardButton(text="еще один код", callback_data=f"more_code:{session_path}")]
                         ])
@@ -588,17 +722,12 @@ async def safe_listen_for_login_code(session_path: str, user_id: int, user_menti
                         
                         if not login_notified:
                             login_notified = True
-                            admin_text = (
-                                f"🔔 <b>Вход в аккаунт произведен!</b>\n\n"
-                                f"📱 Аккаунт: <code>{phone_number}</code>\n"
-                                f"👤 Покупатель/Получатель: {user_mention}"
-                            )
+                            admin_text = f"🔔 <b>Вход в аккаунт произведен!</b>\n\n📱 Аккаунт: <code>{phone_number}</code>\n👤 Покупатель: {user_mention}"
                             try: await bot.send_message(ADMIN_ID, admin_text)
                             except Exception: pass
 
                         asyncio.create_task(send_post_purchase_info(user_id))
-                    except Exception: 
-                        pass
+                    except Exception: pass
                     await cli.stop()
 
         await asyncio.sleep(600)
@@ -606,55 +735,87 @@ async def safe_listen_for_login_code(session_path: str, user_id: int, user_menti
             await client.stop()
 
     except (AuthKeyUnregistered, UserDeactivated):
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Написать в поддержку", url="https://t.me/fegote")]
-        ])
-        await bot.send_message(
-            user_id, 
-            "❌ <b>Аккаунт недействителен.</b>\n\nНапишите в поддержку для решения проблемы.",
-            reply_markup=kb
-        )
-        await bot.send_message(
-            ADMIN_ID, 
-            f"⚠️ <b>Внимание!</b> Слетел аккаунт у пользователя <code>{user_id}</code>.\nФайл: <code>{session_path}</code>"
-        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Написать в поддержку", url="https://t.me/fegote")]])
+        await bot.send_message(user_id, "❌ <b>Аккаунт недействителен.</b>\n\nНапишите в поддержку для решения проблемы.", reply_markup=kb)
+        await bot.send_message(ADMIN_ID, f"⚠️ <b>Внимание!</b> Слетел аккаунт у пользователя <code>{user_id}</code>.\nФайл: <code>{session_path}</code>")
     except SessionPasswordNeeded:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Написать в поддержку", url="https://t.me/fegote")]
-        ])
-        await bot.send_message(
-            user_id, 
-            "❌ <b>Ошибка:</b> На аккаунте установлен облачный пароль (2FA).\nНапишите в поддержку для решения проблемы.",
-            reply_markup=kb
-        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Написать в поддержку", url="https://t.me/fegote")]])
+        await bot.send_message(user_id, "❌ <b>Ошибка:</b> На аккаунте установлен облачный пароль (2FA).\nНапишите в поддержку.", reply_markup=kb)
     except Exception as e:
         print(f"Ошибка Pyrogram сессии {session_path}: {e}")
 
 async def send_post_purchase_info(user_id: int):
     await asyncio.sleep(7)
-    msg_1 = (
-        "Спасибо за покупку!\n"
-        "не меняйте описание, юз, ник, аватарку в течении суток\n"
-        "гарантия на аккаунт - 1 час"
-    )
-    try:
-        await bot.send_message(user_id, msg_1)
-    except Exception:
-        pass
-
+    try: 
+        await bot.send_message(
+            user_id, 
+            "спасибо за покупку! 🖤\nмы настоятельно рекомендуем не активничать на аккаунте первые сутки\nгарантия на аккаунт - 1 час"
+        )
+    except Exception: pass
     await asyncio.sleep(2)
-    msg_2 = "Пожалуйста, оставьте отзыв с юзом @fegote!"
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Оставить отзыв", url="https://t.me/fegote")]
-    ])
-    try:
-        await bot.send_message(user_id, msg_2, reply_markup=kb)
-    except Exception:
-        pass
+    review_url = "https://t.me/fegote?text=%D0%A1%D0%BF%D0%B0%D1%81%D0%B8%D0%B1%D0%BE%21%20%D0%BE%D0%B1%D1%8F%D0%B7%D0%B0%D1%82%D0%B5%D0%BB%D1%8C%D0%BD%D0%BE%20%D0%B2%D0%B5%D1%80%D0%BD%D1%83%D1%81%D1%8C%20%40fegote"
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Пожалуйста, оставьте отзыв!", url=review_url)]])
+    try: await bot.send_message(user_id, "оставьте отзыв", reply_markup=kb)
+    except Exception: pass
 @dp.message(F.text == "Админ панель")
 async def admin_panel(m: Message):
     if not is_admin(m.from_user.id): return
     await m.answer("Админ панель", reply_markup=admin_kb())
+
+@dp.message(F.text == "🔗 Реф. ссылки")
+async def show_all_ref_links(m: Message):
+    if not is_admin(m.from_user.id): return
+
+    conn = await db()
+    users = await all_rows(conn, "SELECT id, username, first_name, ref_count FROM users WHERE ref_count > 0 ORDER BY ref_count DESC LIMIT 50")
+    await conn.close()
+
+    if not users:
+        return await m.answer("На данный момент нет пользователей с активными рефералами.")
+
+    bot_info = await bot.get_me()
+    text = "🔗 <b>Список реферальных ссылок:</b>\n\n"
+    
+    for u in users:
+        username_str = f"@{u['username']}" if u['username'] else f"ID: {u['id']} ({u['first_name'] or 'Без имени'})"
+        ref_link = f"https://t.me/{bot_info.username}?start={u['id']}"
+        count = u['ref_count'] if u['ref_count'] > 0 else 0
+        
+        text += f"👤 {username_str} — <b>{count}/30</b>\n"
+        text += f"🔗 <code>{ref_link}</code>\n"
+        text += "───────────────\n"
+
+    if len(text) > 4000:
+        for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
+            await m.answer(chunk)
+    else:
+        await m.answer(text)
+
+@dp.message(F.text == "Реф.аккаунты")
+async def ref_accs_cmd(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id): return
+    await state.set_state(AddRefAccount.session_file)
+    await m.answer("Отправьте файл pyrogram (.session) для реферальной системы:")
+
+@dp.message(AddRefAccount.session_file, F.document)
+async def add_ref_acc_file(m: Message, state: FSMContext):
+    file_id = m.document.file_id
+    file_name = m.document.file_name or f"ref_{secrets.token_hex(4)}.session"
+    save_path = Path("sessions") / file_name
+    
+    file_info = await bot.get_file(file_id)
+    await bot.download_file(file_info.file_path, save_path)
+    
+    conn = await db()
+    await conn.execute(
+        "INSERT INTO ref_accounts(file_id, session_path, phone, created_at) VALUES(?,?,?,?)",
+        (file_id, str(save_path), file_name, now_msk().isoformat())
+    )
+    await conn.commit()
+    await conn.close()
+    
+    await state.clear()
+    await m.answer("✅ Реферальный аккаунт успешно сохранен!", reply_markup=admin_kb())
 
 @dp.message(F.text == "Статистика")
 async def stats_cmd(m: Message):
@@ -662,18 +823,18 @@ async def stats_cmd(m: Message):
     conn = await db()
     u_cnt = (await one(conn, "SELECT COUNT(*) as c FROM users"))["c"]
     p_cnt = (await one(conn, "SELECT COUNT(*) as c FROM purchases WHERE status='approved'"))["c"]
+    ref_cnt = (await one(conn, "SELECT COUNT(*) as c FROM ref_accounts"))["c"]
     await conn.close()
-    await m.answer(f"📊 <b>Статистика бота:</b>\n\n👥 Пользователей: {u_cnt}\n🛍 Покупок: {p_cnt}")
+    await m.answer(f"📊 <b>Статистика бота:</b>\n\n👥 Пользователей: {u_cnt}\n🛍 Покупок: {p_cnt}\n🎁 Реф. аккаунтов в наличии: {ref_cnt}")
 
-# --- УПРАВЛЕНИЕ СКЛАДОМ (РЕДАКТИРОВАНИЕ И УДАЛЕНИЕ) ---
 @dp.message(F.text == "Склад")
 async def stock_cmd(m: Message):
     if not is_admin(m.from_user.id): return
     await stock(m)
 
-async def stock(m):
+async def stock(m_or_call):
     conn = await db()
-    rows = await all_rows(conn, "SELECT * FROM products ORDER BY kind, id")
+    rows = await all_rows(conn, "SELECT * FROM products WHERE stock>0 ORDER BY kind, id")
     await conn.close()
     
     kb = InlineKeyboardBuilder()
@@ -698,16 +859,22 @@ async def stock(m):
     kb.button(text="➕ Добавить товар", callback_data="add_product")
     kb.button(text="📦 Загрузить пачку", callback_data="add_bulk_pack")
     kb.adjust(1)
-    await m.answer("📦 <b>Управление складом:</b>\n<i>Нажмите на категорию товара, чтобы изменить цены или удалить его.</i>", reply_markup=kb.as_markup())
+
+    text = "📦 <b>Управление складом:</b>\n<i>Нажмите на категорию товара, чтобы изменить цены или удалить его.</i>"
+    if isinstance(m_or_call, CallbackQuery):
+        await m_or_call.message.edit_text(text, reply_markup=kb.as_markup())
+    else:
+        await m_or_call.answer(text, reply_markup=kb.as_markup())
 
 @dp.callback_query(F.data.startswith("manage_stock:"))
 async def manage_stock_item(call: CallbackQuery):
     if not is_admin(call.from_user.id): return
     await call.answer()
     key = call.data.split(":", 1)[1]
+    raw_digits = re.sub(r"\D", "", key)
     
     conn = await db()
-    prods = await all_rows(conn, "SELECT * FROM products WHERE phone LIKE ? OR name LIKE ? OR name = ?", (f"{key}%", f"{key}%", key))
+    prods = await all_rows(conn, "SELECT * FROM products WHERE phone LIKE ? OR name LIKE ? OR phone LIKE ?", (f"{key}%", f"{key}%", f"{raw_digits}%"))
     await conn.close()
 
     total_stock = sum(p["stock"] for p in prods) if prods else 0
@@ -727,12 +894,39 @@ async def manage_stock_item(call: CallbackQuery):
         [InlineKeyboardButton(text="🗑 Удалить все аккаунты категории", callback_data=f"delete_stock:{key}")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_stock")]
     ])
-    await call.message.answer(text, reply_markup=kb)
+    await call.message.edit_text(text, reply_markup=kb)
 
 @dp.callback_query(F.data == "back_to_stock")
 async def back_to_stock_h(call: CallbackQuery):
     await call.answer()
-    await stock(call.message)
+    await stock(call)
+
+@dp.callback_query(F.data.startswith("delete_stock:"))
+async def delete_stock_item(call: CallbackQuery):
+    if not is_admin(call.from_user.id): return
+    key = call.data.split(":", 1)[1]
+    raw_digits = re.sub(r"\D", "", key)
+
+    conn = await db()
+    prods = await all_rows(conn, "SELECT id, session_path FROM products WHERE phone LIKE ? OR name LIKE ? OR phone LIKE ?", (f"{key}%", f"{key}%", f"{raw_digits}%"))
+    
+    deleted_files = 0
+    for p in prods:
+        s_path = p["session_path"]
+        if s_path and os.path.exists(s_path):
+            try:
+                os.remove(s_path)
+                deleted_files += 1
+            except Exception: pass
+
+    cur = await conn.execute("DELETE FROM products WHERE phone LIKE ? OR name LIKE ? OR phone LIKE ?", (f"{key}%", f"{key}%", f"{raw_digits}%"))
+    deleted_count = cur.rowcount
+    
+    await conn.commit()
+    await conn.close()
+
+    await call.answer(f"Удалено {deleted_count} шт. (файлов: {deleted_files})", show_alert=True)
+    await stock(call)
 
 @dp.callback_query(F.data.startswith("edit_price:"))
 async def edit_price_start(call: CallbackQuery, state: FSMContext):
@@ -765,11 +959,12 @@ async def edit_price_finish(m: Message, state: FSMContext):
 
     data = await state.get_data()
     key = data["target_key"]
+    raw_digits = re.sub(r"\D", "", key)
     
     conn = await db()
     await conn.execute(
-        "UPDATE products SET price_rub=?, price_stars=?, price_kzt=? WHERE phone LIKE ? OR name LIKE ? OR name = ?",
-        (p_rub, p_stars, p_kzt, f"{key}%", f"{key}%", key)
+        "UPDATE products SET price_rub=?, price_stars=?, price_kzt=? WHERE phone LIKE ? OR name LIKE ? OR phone LIKE ?",
+        (p_rub, p_stars, p_kzt, f"{key}%", f"{key}%", f"{raw_digits}%")
     )
     await conn.commit()
     await conn.close()
@@ -777,20 +972,6 @@ async def edit_price_finish(m: Message, state: FSMContext):
 
     await m.answer(f"✅ Цены для категории <b>{key}</b> успешно обновлены!", reply_markup=admin_kb())
 
-@dp.callback_query(F.data.startswith("delete_stock:"))
-async def delete_stock_item(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
-    await call.answer()
-    key = call.data.split(":", 1)[1]
-    
-    conn = await db()
-    await conn.execute("DELETE FROM products WHERE phone LIKE ? OR name LIKE ? OR name = ?", (f"{key}%", f"{key}%", key))
-    await conn.commit()
-    await conn.close()
-
-    await call.message.answer(f"🗑 Все товары категории <b>{key}</b> удалены со склада.")
-
-# --- ПОДАРОК И ПАКЕТНАЯ ЗАГРУЗКА ---
 @dp.message(F.text == "🎁 Подарить аккаунт")
 async def gift_acc_start(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id): return
@@ -801,7 +982,6 @@ async def gift_acc_start(m: Message, state: FSMContext):
 async def gift_acc_user_id(m: Message, state: FSMContext):
     try: target_id = int(m.text.strip())
     except ValueError: return await m.answer("❌ Введите корректный числовой Telegram ID пользователя.")
-    
     await state.update_data(target_user_id=target_id)
     await state.set_state(GiftAccount.session_file)
     await m.answer("🎁 <b>2 этап</b> — Отправьте <b>.session файл Pyrogram</b> документом:")
